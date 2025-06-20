@@ -1,0 +1,28 @@
+{
+  "name": "uno-backend",
+  "version": "1.0.0",
+  "description": "Backend server for real-time multiplayer UNO card game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "uno",
+    "card-game",
+    "multiplayer",
+    "backend",
+    "express",
+    "websocket",
+    "socket.io",
+    "real-time"
+  ],
+  "author": "UNO Online Backend Team",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.1.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1"
+  }
+}
