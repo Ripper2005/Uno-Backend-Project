@@ -6,7 +6,7 @@ A complete real-time multiplayer UNO card game backend built with Node.js, Expre
 
 - **Complete UNO Game Logic**: Full implementation of official UNO rules with 108-card deck
 - **Real-time Multiplayer**: WebSocket-based gameplay supporting 2-10 players per room
-- **Room Management**: Create and join game rooms with automatic game initialization
+- **Room Management**: Create and join game rooms with manual game initialization
 - **Player Disconnect Handling**: Robust disconnect/reconnect logic with game state preservation
 - **RESTful API**: HTTP endpoints for room creation and status checking
 - **Scalable Architecture**: Modular design with separate game engine and server logic
@@ -63,16 +63,14 @@ Creates a new game room.
 **Request Body:**
 ```json
 {
-  "playerName": "Player1"
+  "playerId": "player1"
 }
 ```
 
 **Response:**
 ```json
 {
-  "roomId": "room_abc123",
-  "playerId": "player_def456",
-  "message": "Room created successfully"
+  "roomId": "ABC123"
 }
 ```
 
@@ -82,36 +80,71 @@ Joins an existing game room.
 **Request Body:**
 ```json
 {
-  "playerName": "Player2"
+  "playerId": "player2"
 }
 ```
 
 **Response:**
 ```json
 {
-  "playerId": "player_ghi789",
-  "message": "Joined room successfully"
+  "success": true,
+  "message": "Player joined successfully",
+  "gameStarted": false,
+  "canStart": true
 }
 ```
 
 #### GET /api/rooms/:roomId
 Gets current room information and game state.
 
-**Response:**
+**Response (Waiting for players):**
 ```json
 {
-  "room": {
-    "id": "room_abc123",
-    "players": [
-      {
-        "id": "player_def456",
-        "name": "Player1",
-        "connected": true
-      }
-    ],
-    "state": "waiting",
-    "gameState": null
-  }
+  "roomId": "ABC123",
+  "status": "waiting",
+  "host": "player1",
+  "players": [
+    {
+      "id": "player1"
+    },
+    {
+      "id": "player2" 
+    }
+  ],
+  "playerCount": 2,
+  "maxPlayers": 10,
+  "canStart": true
+}
+```
+
+**Response (Game in progress):**
+```json
+{
+  "roomId": "ABC123",
+  "status": "playing",
+  "host": "player1",
+  "players": [
+    {
+      "id": "player1",
+      "handSize": 6
+    },
+    {
+      "id": "player2",
+      "handSize": 7
+    }
+  ],
+  "currentPlayerIndex": 0,
+  "currentPlayer": "player1",
+  "directionOfPlay": 1,
+  "currentColor": "red",
+  "topCard": {
+    "color": "red",
+    "value": "5",
+    "type": "number"
+  },
+  "drawPileSize": 85,
+  "isGameOver": false,
+  "winner": null
 }
 ```
 
@@ -133,14 +166,19 @@ Join a specific room for real-time updates.
 ```
 
 ##### `startGame`
-Start the game (only available when room has 2+ players).
+Start the game manually (host only). This event initializes the game, deals cards to all players, and begins gameplay.
 
 **Payload:**
 ```json
 {
-  "roomId": "room_abc123",
-  "playerId": "player_def456"
+  "roomId": "room_abc123"
 }
+```
+
+**Requirements:**
+- Only the room host can start the game
+- Room must be in "waiting" status
+- At least 2 players must have joined the room
 ```
 
 ##### `playCard`
@@ -174,41 +212,68 @@ Draw a card from the deck.
 #### Server → Client Events
 
 ##### `gameUpdate`
-Sent when game state changes (card played, card drawn, turn changes).
+**Primary event for frontend synchronization.** Sent whenever the game state changes (game start, card played, card drawn, turn changes). This is the main event your frontend should listen to for real-time game updates.
 
 **Payload:**
 ```json
 {
-  "gameState": {
-    "players": [...],
-    "currentPlayerIndex": 0,
-    "currentColor": "red",
-    "discardPile": [...],
-    "drawPileCount": 85,
-    "directionOfPlay": 1,
-    "isGameOver": false,
-    "winner": null
+  "roomId": "room_abc123",
+  "status": "playing",
+  "host": "player_def456",
+  "players": [
+    {
+      "id": "player_def456",
+      "handSize": 7,
+      "isActive": true
+    },
+    {
+      "id": "player_ghi789", 
+      "handSize": 6,
+      "isActive": true
+    }
+  ],
+  "currentPlayerIndex": 0,
+  "currentPlayer": "player_def456",
+  "directionOfPlay": 1,
+  "currentColor": "red",
+  "topCard": {
+    "color": "red",
+    "value": "5", 
+    "type": "number"
   },
-  "lastAction": {
-    "type": "cardPlayed",
-    "playerId": "player_def456",
-    "card": {...}
+  "drawPileSize": 85,
+  "isGameOver": false,
+  "winner": null
+}
+```
+
+##### `gameStarted`
+Sent when the game officially begins after host triggers startGame.
+
+**Payload:**
+```json
+{
+  "message": "Game has started! Cards have been dealt.",
+  "currentPlayer": "player_def456",
+  "topCard": {
+    "color": "red",
+    "value": "7",
+    "type": "number"
   }
 }
 ```
 
 ##### `gameOver`
-Sent when a player wins the game.
+Sent when a player wins the game or game ends due to disconnections.
 
 **Payload:**
 ```json
 {
-  "winner": {
-    "id": "player_def456",
-    "name": "Player1"
-  },
-  "gameState": {...}
+  "winnerId": "player_def456",
+  "message": "player_def456 wins the game!",
+  "reason": "normal"
 }
+```
 ```
 
 ##### `error`
@@ -221,29 +286,147 @@ Sent when an invalid action is attempted.
 }
 ```
 
-##### `playerJoined`
-Sent when a new player joins the room.
+##### `playerConnected`
+Sent when a player joins the WebSocket room.
 
 **Payload:**
 ```json
 {
-  "player": {
-    "id": "player_ghi789",
-    "name": "Player2"
-  },
-  "room": {...}
+  "playerId": "player_ghi789"
 }
 ```
 
-##### `playerLeft`
-Sent when a player disconnects.
+##### `playerDisconnected`
+Sent when a player disconnects from the game.
 
 **Payload:**
 ```json
 {
   "playerId": "player_ghi789",
-  "room": {...}
+  "message": "player_ghi789 has disconnected and will be skipped"
 }
+```
+
+## Game Setup Flow
+
+This section explains the complete sequence for setting up and starting a UNO game using both HTTP API and WebSocket events.
+
+### Frontend Implementation Steps
+
+1. **Create Room (HTTP API)**
+   ```javascript
+   const response = await fetch('http://localhost:3001/api/rooms/create', {
+     method: 'POST',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ playerId: 'player1' })
+   });
+   const { roomId } = await response.json();
+   // roomId: "ABC123"
+   ```
+
+2. **Other Players Join Room (HTTP API)**
+   ```javascript
+   const response = await fetch(`http://localhost:3001/api/rooms/${roomId}/join`, {
+     method: 'POST', 
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ playerId: 'player2' })
+   });
+   const result = await response.json();
+   // result: { success: true, message: "Player joined successfully", canStart: true }
+   ```
+
+3. **All Players Connect to WebSocket**
+   ```javascript
+   const socket = io('http://localhost:3001');
+   
+   // Each player joins the WebSocket room
+   socket.emit('joinRoom', { 
+     roomId: 'ABC123', 
+     playerId: 'player1' // or player2, etc.
+   });
+   ```
+
+4. **Listen for Game Updates (All Players)**
+   ```javascript
+   // Primary event - listen for all game state changes
+   socket.on('gameUpdate', (gameState) => {
+     console.log('Game state updated:', gameState);
+     // Update your UI with current game state
+     updateGameUI(gameState);
+   });
+   
+   // Game start notification
+   socket.on('gameStarted', (data) => {
+     console.log('Game started!', data.message);
+     console.log('First player:', data.currentPlayer);
+   });
+   ```
+
+5. **Host Starts the Game (Host Only)**
+   ```javascript
+   // Only the room host can start the game
+   socket.emit('startGame', { roomId: 'ABC123' });
+   ```
+
+6. **Game Begins**
+   - All players receive `gameStarted` event
+   - All players receive `gameUpdate` event with initial game state
+   - Cards are dealt (7 per player)
+   - First player can begin making moves
+
+### Complete Integration Example
+
+```javascript
+// Frontend game setup example
+class UnoGame {
+  constructor() {
+    this.socket = io('http://localhost:3001');
+    this.setupSocketListeners();
+  }
+  
+  async createRoom(playerId) {
+    const response = await fetch('http://localhost:3001/api/rooms/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId })
+    });
+    const { roomId } = await response.json();
+    
+    // Join WebSocket room
+    this.socket.emit('joinRoom', { roomId, playerId });
+    return roomId;
+  }
+  
+  async joinRoom(roomId, playerId) {
+    const response = await fetch(`http://localhost:3001/api/rooms/${roomId}/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playerId })
+    });
+    
+    // Join WebSocket room
+    this.socket.emit('joinRoom', { roomId, playerId });
+  }
+  
+  startGame(roomId) {
+    this.socket.emit('startGame', { roomId });
+  }
+  
+  setupSocketListeners() {
+    this.socket.on('gameUpdate', (gameState) => {
+      this.updateUI(gameState);
+    });
+    
+    this.socket.on('gameStarted', (data) => {
+      console.log('Game started:', data.message);
+    });
+    
+    this.socket.on('error', (error) => {
+      console.error('Game error:', error.message);
+    });
+  }
+}
+```
 ```
 
 ## Game Rules
@@ -293,12 +476,12 @@ curl http://localhost:3001/api/status
 # Create a room
 curl -X POST http://localhost:3001/api/rooms/create \
   -H "Content-Type: application/json" \
-  -d '{"playerName": "TestPlayer"}'
+  -d '{"playerId": "TestPlayer"}'
 
-# Join a room
+# Join a room  
 curl -X POST http://localhost:3001/api/rooms/ROOM_ID/join \
   -H "Content-Type: application/json" \
-  -d '{"playerName": "Player2"}'
+  -d '{"playerId": "Player2"}'
 ```
 
 ### WebSocket Testing
@@ -308,16 +491,25 @@ You can test WebSocket functionality using the Socket.io client:
 const io = require('socket.io-client');
 const socket = io('http://localhost:3001');
 
-// Join a room
-socket.emit('joinRoom', { roomId: 'room_abc123', playerId: 'player_def456' });
+// Join a room (after joining via HTTP API)
+socket.emit('joinRoom', { roomId: 'ABC123', playerId: 'player1' });
 
-// Listen for game updates
-socket.on('gameUpdate', (data) => {
-  console.log('Game updated:', data);
+// Listen for game updates (main event)
+socket.on('gameUpdate', (gameState) => {
+  console.log('Game state updated:', gameState);
 });
 
-// Start a game
-socket.emit('startGame', { roomId: 'room_abc123', playerId: 'player_def456' });
+// Listen for game start
+socket.on('gameStarted', (data) => {
+  console.log('Game started:', data.message);
+});
+
+// Start a game (host only)
+socket.emit('startGame', { roomId: 'ABC123' });
+});
+
+// Start a game (host only)
+socket.emit('startGame', { roomId: 'ABC123' });
 ```
 
 ## Architecture

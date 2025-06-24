@@ -186,34 +186,21 @@ app.post('/api/rooms/:roomId/join', (req, res) => {
                 error: 'Room is full (maximum 10 players)'
             });
         }
-        
-        // Add player to the room
+          // Add player to the room
         room.players.push({
             id: playerId.trim(),
             hand: []
         });
         
-        // Start the game if we have at least 2 players and game hasn't started yet
-        if (room.players.length >= 2 && room.status === 'waiting') {
-            try {
-                const playerIds = room.players.map(player => player.id);
-                room.gameState = GameEngine.createGameState(playerIds);
-                room.status = 'playing';
-                console.log(`Game started in room ${roomId} with ${room.players.length} players`);
-            } catch (gameError) {
-                console.error('Error starting game:', gameError);
-                return res.status(500).json({
-                    error: 'Failed to start game'
-                });
-            }
-        }
+        // Note: Game will be started via WebSocket 'startGame' event
+        // Auto-start removed to allow manual game initiation
         
         console.log(`Player ${playerId} joined room: ${roomId} (${room.players.length} players total)`);
-        
-        res.json({
+          res.json({
             success: true,
             message: 'Player joined successfully',
-            gameStarted: room.status === 'playing'
+            gameStarted: false,
+            canStart: room.players.length >= 2
         });
         
     } catch (error) {
@@ -431,13 +418,27 @@ io.on('connection', (socket) => {
             socket.emit('error', { message: 'Failed to join room' });
         }
     });
-    
-    // Start the game (only host can do this)
+      // Start the game (only host can do this)
     socket.on('startGame', ({ roomId }) => {
         try {
+            console.log(`StartGame event received for room ${roomId} from socket ${socket.id}`);
+            
+            // Validate input
+            if (!roomId) {
+                socket.emit('error', { message: 'Room ID is required' });
+                return;
+            }
+            
+            // Look up the game state in activeGames
             const room = activeGames[roomId];
             if (!room) {
                 socket.emit('error', { message: 'Room not found' });
+                return;
+            }
+            
+            // Validate that socket player is in the room
+            if (!socket.playerId) {
+                socket.emit('error', { message: 'Player not identified' });
                 return;
             }
             
@@ -447,32 +448,48 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // Check if game can be started
+            // Ensure there are at least 2 players
             if (room.players.length < 2) {
-                socket.emit('error', { message: 'Need at least 2 players to start' });
+                socket.emit('error', { message: 'Need at least 2 players to start the game' });
                 return;
             }
             
+            // Check if game has already started
             if (room.status !== 'waiting') {
-                socket.emit('error', { message: 'Game has already started' });
+                socket.emit('error', { message: 'Game has already started or finished' });
                 return;
             }
             
-            // Start the game
+            // Extract player IDs from the room
             const playerIds = room.players.map(player => player.id);
-            room.gameState = GameEngine.createGameState(playerIds);
+            console.log(`Starting game with players: ${playerIds.join(', ')}`);
+            
+            // Call GameEngine to create the official game state
+            const initialGameState = GameEngine.createGameState(playerIds);
+            
+            // Update the room with the complete game state
+            room.gameState = initialGameState;
             room.status = 'playing';
             
-            console.log(`Game started in room ${roomId} by host ${socket.playerId}`);
+            console.log(`Game officially started in room ${roomId} with ${playerIds.length} players`);
+            console.log(`Current player: ${initialGameState.players[initialGameState.currentPlayerIndex].id}`);
             
-            // Broadcast game state to all players in room
-            const roomState = getRoomStateForClient(room);
-            io.to(roomId).emit('gameUpdate', roomState);
-            io.to(roomId).emit('gameStarted', { message: 'Game has started!' });
+            // Broadcast gameUpdate to all clients in the room
+            const roomStateForClients = getRoomStateForClient(room);
+            io.to(roomId).emit('gameUpdate', roomStateForClients);
+            
+            // Also send a specific gameStarted event
+            io.to(roomId).emit('gameStarted', { 
+                message: 'Game has started! Cards have been dealt.',
+                currentPlayer: initialGameState.players[initialGameState.currentPlayerIndex].id,
+                topCard: initialGameState.discardPile[initialGameState.discardPile.length - 1]
+            });
+            
+            console.log(`Game update broadcasted to all clients in room ${roomId}`);
             
         } catch (error) {
             console.error('Error starting game:', error);
-            socket.emit('error', { message: 'Failed to start game' });
+            socket.emit('error', { message: 'Failed to start game: ' + error.message });
         }
     });
     
