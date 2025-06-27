@@ -5,10 +5,12 @@
  * all game rules, state management, and validations according to official UNO rules.
  * 
  * This module is completely independent and can be used with any server framework.
- * It exports three main functions:
+ * It exports five main functions:
  * - createGameState(): Initialize a new game
  * - playCard(): Process a card play move
  * - drawCard(): Process a card draw move
+ * - playDrawnCard(): Play a card that was just drawn
+ * - passDrawnCard(): Pass on a card that was just drawn
  * 
  * @author UNO Online Backend Team
  * @version 1.0.0
@@ -457,12 +459,12 @@ function playCard(gameState, playerId, cardToPlay, chosenColor = null) {
 
 /**
  * Handles a player drawing a card
- * This function allows the current player to draw one card from the draw pile,
- * adds it to their hand, and ends their turn.
+ * This function implements the official UNO rule where a player can play a drawn card immediately if valid.
+ * If the drawn card is playable, it enters a "limbo state" where the player can choose to play or pass.
  * 
  * @param {Object} gameState - Current game state
  * @param {string} playerId - ID of player drawing the card
- * @returns {Object} Updated game state with drawn card added to hand and turn ended
+ * @returns {Object} Updated game state with either playableDrawnCard or card added to hand
  */
 function drawCard(gameState, playerId) {
     // Validate game is not over
@@ -498,8 +500,151 @@ function drawCard(gameState, playerId) {
     // Draw exactly one card from the draw pile
     const drawnCard = newState.drawPile.shift();
     
+    // Check if the drawn card can be played
+    const topCard = newState.discardPile[newState.discardPile.length - 1];
+    const isPlayable = isMoveValid(drawnCard, topCard, newState.currentColor);
+    
+    if (isPlayable) {
+        // Enter "limbo state" - card is playable, let player choose
+        newState.playableDrawnCard = { ...drawnCard };
+        // Don't add to hand, don't end turn
+        return newState;
+    } else {
+        // Card is not playable - add to hand and end turn
+        newState.players[newState.currentPlayerIndex].hand.push(drawnCard);
+        newState.currentPlayerIndex = getNextPlayerIndex(newState, 1);
+        newState.playableDrawnCard = null;
+        return newState;
+    }
+}
+
+/**
+ * Handles a player choosing to play their drawn card
+ * This function is called when a player decides to play the card they just drew.
+ * 
+ * @param {Object} gameState - Current game state (must contain playableDrawnCard)
+ * @param {string} playerId - ID of player playing the drawn card
+ * @param {string} chosenColor - Color chosen for wild cards (required for wild cards)
+ * @returns {Object} Updated game state with card played and limbo state cleared
+ */
+function playDrawnCard(gameState, playerId, chosenColor = null) {
+    // Validate game is not over
+    if (gameState.isGameOver) {
+        return { error: 'Game is already over' };
+    }
+    
+    // Validate it's the player's turn
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (!currentPlayer || currentPlayer.id !== playerId) {
+        return { error: 'Not your turn' };
+    }
+    
+    // Validate playableDrawnCard exists
+    if (!gameState.playableDrawnCard) {
+        return { error: 'No drawn card available to play' };
+    }
+    
+    const cardToPlay = gameState.playableDrawnCard;
+    
+    // Validate wild card has chosen color
+    if (cardToPlay.type === 'wild' && !chosenColor) {
+        return { error: 'Must choose a color for wild card' };
+    }
+    
+    if (cardToPlay.type === 'wild' && !COLORS.includes(chosenColor)) {
+        return { error: 'Invalid color choice' };
+    }
+    
+    // Validate Wild Draw 4 can only be played if no other valid cards available
+    if (cardToPlay.value === 'wild_draw4') {
+        const topCard = gameState.discardPile[gameState.discardPile.length - 1];
+        // Check if player has any cards that match the current color or top card value
+        const hasMatchingCard = currentPlayer.hand.some(card => {
+            if (card.type === 'wild') {
+                return false; // Don't count other wild cards
+            }
+            return card.color === gameState.currentColor || card.value === topCard.value;
+        });
+        
+        if (hasMatchingCard) {
+            return { error: 'Wild Draw 4 can only be played when you have no cards matching the current color' };
+        }
+    }
+    
+    // Create new game state with deep copies
+    const newState = { ...gameState };
+    newState.players = gameState.players.map(player => ({
+        ...player,
+        hand: [...player.hand]
+    }));
+    newState.drawPile = [...gameState.drawPile];
+    newState.discardPile = [...gameState.discardPile];
+    
+    // Add card to discard pile
+    newState.discardPile.push(cardToPlay);
+    
+    // Clear the playableDrawnCard (exit limbo state)
+    newState.playableDrawnCard = null;
+    
+    // Apply card effect (this handles turn advancement based on card type)
+    const stateAfterEffect = applyCardEffect(newState, cardToPlay, chosenColor);
+    
+    // Check for winner after applying effects (check the player who just played)
+    if (checkWinner(newState.players[newState.currentPlayerIndex])) {
+        stateAfterEffect.isGameOver = true;
+        stateAfterEffect.winner = playerId;
+    }
+    
+    // Only advance turn for cards that don't handle their own turn logic
+    // Action cards (skip, reverse, draw2, wild_draw4) handle turn advancement internally
+    if (cardToPlay.type === 'number' || 
+        (cardToPlay.type === 'wild' && cardToPlay.value === 'wild')) {
+        stateAfterEffect.currentPlayerIndex = getNextPlayerIndex(stateAfterEffect, 1);
+    }
+    
+    return stateAfterEffect;
+}
+
+/**
+ * Handles a player choosing to pass on their drawn card
+ * This function is called when a player decides not to play the card they just drew.
+ * 
+ * @param {Object} gameState - Current game state (must contain playableDrawnCard)
+ * @param {string} playerId - ID of player passing on the drawn card
+ * @returns {Object} Updated game state with card added to hand and turn ended
+ */
+function passDrawnCard(gameState, playerId) {
+    // Validate game is not over
+    if (gameState.isGameOver) {
+        return { error: 'Game is already over' };
+    }
+    
+    // Validate it's the player's turn
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (!currentPlayer || currentPlayer.id !== playerId) {
+        return { error: 'Not your turn' };
+    }
+    
+    // Validate playableDrawnCard exists
+    if (!gameState.playableDrawnCard) {
+        return { error: 'No drawn card available to pass' };
+    }
+    
+    // Create new game state with deep copies
+    const newState = { ...gameState };
+    newState.players = gameState.players.map(player => ({
+        ...player,
+        hand: [...player.hand]
+    }));
+    newState.drawPile = [...gameState.drawPile];
+    newState.discardPile = [...gameState.discardPile];
+    
     // Add the drawn card to the current player's hand
+    const drawnCard = gameState.playableDrawnCard;
     newState.players[newState.currentPlayerIndex].hand.push(drawnCard);
+    
+    // Clear the playableDrawnCard (exit limbo state)
+    newState.playableDrawnCard = null;
     
     // End the current player's turn by advancing to the next player
     newState.currentPlayerIndex = getNextPlayerIndex(newState, 1);
@@ -511,5 +656,7 @@ function drawCard(gameState, playerId) {
 module.exports = {
     createGameState,
     playCard,
-    drawCard
+    drawCard,
+    playDrawnCard,
+    passDrawnCard
 };

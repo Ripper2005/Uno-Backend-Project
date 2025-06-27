@@ -15,6 +15,7 @@
 // Import required libraries
 const express = require('express');
 const { createServer } = require('http');
+const cors = require('cors'); // <-- Import
 const { Server } = require('socket.io');
 
 // Import the Game Engine - handles all UNO game logic
@@ -47,9 +48,24 @@ const io = new Server(httpServer, {
  */
 let activeGames = {};
 
+/**
+ * In-memory storage for registered users
+ * Structure: {
+ *   username: {
+ *     username: string,
+ *     name: string,
+ *     password: string,
+ *     avatar: string,
+ *     registeredAt: Date
+ *   }
+ * }
+ */
+let registeredUsers = {};
+
 // Server configuration
 const PORT = 3001;
 
+app.use(cors());
 // Middleware to parse JSON requests from HTTP API calls
 app.use(express.json());
 
@@ -90,6 +106,139 @@ app.get('/api/status', (req, res) => {
         activeRooms: Object.keys(activeGames).length
     });
 });
+
+// ============================================================================
+// AUTHENTICATION ENDPOINTS
+// ============================================================================
+
+/**
+ * POST /api/auth/register
+ * Registers a new user account
+ * Body: { name: string, username: string, password: string, avatar: string }
+ * Returns: { success: boolean, message: string }
+ */
+app.post('/api/auth/register', (req, res) => {
+    try {
+        const { name, username, password, avatar } = req.body;
+        
+        // Validate required fields
+        if (!name || !username || !password || !avatar) {
+            return res.status(400).json({
+                error: 'All fields are required: name, username, password, avatar'
+            });
+        }
+        
+        // Check if fields are not empty strings
+        if (typeof name !== 'string' || name.trim() === '' ||
+            typeof username !== 'string' || username.trim() === '' ||
+            typeof password !== 'string' || password.trim() === '' ||
+            typeof avatar !== 'string' || avatar.trim() === '') {
+            return res.status(400).json({
+                error: 'All fields must be non-empty strings'
+            });
+        }
+        
+        // Check if username already exists
+        if (registeredUsers[username.trim()]) {
+            return res.status(400).json({
+                error: 'Username already exists'
+            });
+        }
+        
+        // Create new user (simulate password hashing with simple suffix)
+        const newUser = {
+            username: username.trim(),
+            name: name.trim(),
+            password: password + '_secret', // Simple password "hashing" simulation
+            avatar: avatar.trim(),
+            registeredAt: new Date()
+        };
+        
+        // Store user in our "database"
+        registeredUsers[username.trim()] = newUser;
+        
+        console.log(`New user registered: ${username}`);
+        
+        res.status(201).json({
+            success: true,
+            message: 'User registered successfully'
+        });
+        
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({
+            error: 'Internal server error during registration'
+        });
+    }
+});
+
+/**
+ * POST /api/auth/login
+ * Authenticates a user and returns their profile data
+ * Body: { username: string, password: string }
+ * Returns: { success: boolean, user: object } or { error: string }
+ */
+app.post('/api/auth/login', (req, res) => {
+    try {
+        const { username, password } = req.body;
+        
+        // Validate required fields
+        if (!username || !password) {
+            return res.status(400).json({
+                error: 'Username and password are required'
+            });
+        }
+        
+        // Check if fields are not empty strings
+        if (typeof username !== 'string' || username.trim() === '' ||
+            typeof password !== 'string' || password.trim() === '') {
+            return res.status(400).json({
+                error: 'Username and password must be non-empty strings'
+            });
+        }
+        
+        // Find user in our "database"
+        const user = registeredUsers[username.trim()];
+        
+        if (!user) {
+            return res.status(401).json({
+                error: 'Invalid username or password'
+            });
+        }
+        
+        // Verify password (simulate password verification)
+        const expectedPassword = password + '_secret';
+        if (user.password !== expectedPassword) {
+            return res.status(401).json({
+                error: 'Invalid username or password'
+            });
+        }
+        
+        // Login successful - return user data without password
+        const userData = {
+            username: user.username,
+            name: user.name,
+            avatar: user.avatar
+        };
+        
+        console.log(`User logged in: ${username}`);
+        
+        res.status(200).json({
+            success: true,
+            user: userData
+        });
+        
+    } catch (error) {
+        console.error('Login error:', error);
+        res.status(500).json({
+            error: 'Internal server error during login'
+        });
+    }
+});
+
+// ============================================================================
+// ROOM MANAGEMENT ENDPOINTS
+// ============================================================================
 
 /**
  * POST /api/rooms/create
@@ -192,6 +341,9 @@ app.post('/api/rooms/:roomId/join', (req, res) => {
             hand: []
         });
         
+        // Broadcast updated room state to all connected clients in the room
+        io.to(roomId).emit('gameUpdate', getRoomStateForClient(room));
+        
         // Note: Game will be started via WebSocket 'startGame' event
         // Auto-start removed to allow manual game initiation
         
@@ -213,7 +365,7 @@ app.post('/api/rooms/:roomId/join', (req, res) => {
 
 /**
  * GET /api/rooms/:roomId
- * Returns the current state of a specific game room
+ * Returns the current state of a specific game room with enriched player data
  * Params: roomId (string)
  * Returns: Room state object with player info, game status, etc.
  */
@@ -229,52 +381,9 @@ app.get('/api/rooms/:roomId', (req, res) => {
             });
         }
         
-        // Return different data based on room status
-        if (room.status === 'waiting') {
-            // Room is waiting for players
-            res.json({
-                roomId: roomId,
-                status: 'waiting',
-                host: room.host,
-                players: room.players.map(player => ({
-                    id: player.id
-                })),
-                playerCount: room.players.length,
-                maxPlayers: 10,
-                canStart: room.players.length >= 2
-            });
-        } else if (room.status === 'playing' && room.gameState) {
-            // Game is in progress
-            const gameState = room.gameState;
-            res.json({
-                roomId: roomId,
-                status: 'playing',
-                host: room.host,
-                players: gameState.players.map(player => ({
-                    id: player.id,
-                    handSize: player.hand.length
-                })),
-                currentPlayerIndex: gameState.currentPlayerIndex,
-                currentPlayer: gameState.players[gameState.currentPlayerIndex]?.id,
-                directionOfPlay: gameState.directionOfPlay,
-                currentColor: gameState.currentColor,
-                topCard: gameState.discardPile[gameState.discardPile.length - 1],
-                drawPileSize: gameState.drawPile.length,
-                isGameOver: gameState.isGameOver,
-                winner: gameState.winner
-            });
-        } else {
-            // Game finished or unknown state
-            res.json({
-                roomId: roomId,
-                status: room.status,
-                host: room.host,
-                players: room.players.map(player => ({
-                    id: player.id
-                })),
-                playerCount: room.players.length
-            });
-        }
+        // Use the same enriched function as WebSocket events
+        const roomState = getRoomStateForClient(room);
+        res.json(roomState);
         
     } catch (error) {
         console.error('Error getting room state:', error);
@@ -578,6 +687,93 @@ io.on('connection', (socket) => {
             socket.emit('error', { message: 'Failed to draw card' });
         }
     });
+    
+    // Handle playing a drawn card (from limbo state)
+    socket.on('playDrawnCard', ({ roomId, playerId, chosenColor }) => {
+        try {
+            const room = activeGames[roomId];
+            if (!room || !room.gameState) {
+                socket.emit('error', { message: 'Game not found or not started' });
+                return;
+            }
+            
+            // Validate player
+            if (playerId !== socket.playerId) {
+                socket.emit('error', { message: 'Invalid player ID' });
+                return;
+            }
+            
+            // Use GameEngine to process playing the drawn card
+            const result = GameEngine.playDrawnCard(room.gameState, playerId, chosenColor);
+            
+            if (result.error) {
+                socket.emit('error', { message: result.error });
+                return;
+            }
+            
+            // Update the game state
+            room.gameState = result;
+            
+            console.log(`Player ${playerId} played their drawn card`);
+            
+            // Check if game is over
+            if (result.isGameOver) {
+                room.status = 'finished';
+                console.log(`Game over! Winner: ${result.winner}`);
+                io.to(roomId).emit('gameOver', { 
+                    winnerId: result.winner,
+                    message: `${result.winner} wins the game!`
+                });
+            }
+            
+            // Broadcast updated game state to all players
+            const roomState = getRoomStateForClient(room);
+            io.to(roomId).emit('gameUpdate', roomState);
+            
+        } catch (error) {
+            console.error('Error playing drawn card:', error);
+            socket.emit('error', { message: 'Failed to play drawn card' });
+        }
+    });
+    
+    // Handle passing on a drawn card (from limbo state)
+    socket.on('passDrawnCard', ({ roomId, playerId }) => {
+        try {
+            const room = activeGames[roomId];
+            if (!room || !room.gameState) {
+                socket.emit('error', { message: 'Game not found or not started' });
+                return;
+            }
+            
+            // Validate player
+            if (playerId !== socket.playerId) {
+                socket.emit('error', { message: 'Invalid player ID' });
+                return;
+            }
+            
+            // Use GameEngine to process passing the drawn card
+            const result = GameEngine.passDrawnCard(room.gameState, playerId);
+            
+            if (result.error) {
+                socket.emit('error', { message: result.error });
+                return;
+            }
+            
+            // Update the game state
+            room.gameState = result;
+            
+            console.log(`Player ${playerId} passed on their drawn card`);
+            
+            // Broadcast updated game state to all players
+            const roomState = getRoomStateForClient(room);
+            io.to(roomId).emit('gameUpdate', roomState);
+            
+        } catch (error) {
+            console.error('Error passing drawn card:', error);
+            socket.emit('error', { message: 'Failed to pass drawn card' });
+        }
+    });
+    
       // Handle player disconnect
     socket.on('disconnect', () => {
         console.log(`Socket disconnected: ${socket.id}`);
@@ -709,29 +905,45 @@ function getNextActivePlayerIndex(gameState) {
 }
 
 /**
- * Converts room data to client-safe format
+ * Converts room data to client-safe format with enriched player data
+ * Looks up player display information from registeredUsers database
  * @param {Object} room - Room object from activeGames
- * @returns {Object} Client-safe room state
+ * @returns {Object} Client-safe room state with full player info
  */
 function getRoomStateForClient(room) {
+    /**
+     * Helper function to enrich player data with name and avatar
+     * @param {Object} player - Player object with at least an id
+     * @returns {Object} Enriched player object with { id, name, avatar, handSize?, isActive? }
+     */
+    function enrichPlayerData(player) {
+        const userData = registeredUsers[player.id];
+        return {
+            id: player.id,
+            name: userData ? userData.name : player.id, // Fallback to id if user not found
+            avatar: userData ? userData.avatar : 'public/assets/images/avatar/a1.jpg', // Default avatar
+            ...(player.handSize !== undefined && { handSize: player.handSize }),
+            ...(player.isActive !== undefined && { isActive: player.isActive })
+        };
+    }
+
     if (room.status === 'waiting') {
         return {
             roomId: room.roomId,
             status: 'waiting',
             host: room.host,
-            players: room.players.map(player => ({
-                id: player.id
-            })),
+            players: room.players.map(player => enrichPlayerData({ id: player.id })),
             playerCount: room.players.length,
             maxPlayers: 10,
             canStart: room.players.length >= 2
-        };    } else if (room.status === 'playing' && room.gameState) {
+        };
+    } else if (room.status === 'playing' && room.gameState) {
         const gameState = room.gameState;
         return {
             roomId: room.roomId,
             status: 'playing',
             host: room.host,
-            players: gameState.players.map(player => ({
+            players: gameState.players.map(player => enrichPlayerData({
                 id: player.id,
                 handSize: player.hand.length,
                 isActive: player.isActive !== false // Default to true if not set
@@ -743,28 +955,28 @@ function getRoomStateForClient(room) {
             topCard: gameState.discardPile[gameState.discardPile.length - 1],
             drawPileSize: gameState.drawPile.length,
             isGameOver: gameState.isGameOver,
-            winner: gameState.winner
+            winner: gameState.winner,
+            playableDrawnCard: gameState.playableDrawnCard || null
         };
     } else {
         return {
             roomId: room.roomId,
             status: room.status,
             host: room.host,
-            players: room.players.map(player => ({
-                id: player.id
-            })),
+            players: room.players.map(player => enrichPlayerData({ id: player.id })),
             playerCount: room.players.length
         };
     }
 }
 
 // Start the server, making it listen on the defined port
-httpServer.listen(PORT, () => {
-    console.log(`UNO Backend server is running on port ${PORT}`);
+httpServer.listen(PORT, () => {    console.log(`UNO Backend server is running on port ${PORT}`);
     console.log(`Server URL: http://localhost:${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
     console.log('\nAvailable API endpoints:');
     console.log(`  GET  /api/status                    - Server status`);
+    console.log(`  POST /api/auth/register             - Register new user account`);
+    console.log(`  POST /api/auth/login                - Login user account`);
     console.log(`  GET  /api/rooms                     - List all active rooms`);
     console.log(`  POST /api/rooms/create              - Create new game room`);
     console.log(`  POST /api/rooms/:roomId/join        - Join existing room`);
@@ -773,6 +985,8 @@ httpServer.listen(PORT, () => {
     console.log(`  joinRoom     - Join a game room`);
     console.log(`  startGame    - Start the game (host only)`);
     console.log(`  playCard     - Play a card`);
-    console.log(`  drawCard     - Draw a card`);
-    console.log('\nGame rooms will be stored in memory and reset on server restart.');
+    console.log(`  drawCard       - Draw a card`);
+    console.log(`  playDrawnCard  - Play a card that was just drawn`);
+    console.log(`  passDrawnCard  - Pass on a card that was just drawn`);
+    console.log('\nUser accounts and game rooms will be stored in memory and reset on server restart.');
 });
