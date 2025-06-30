@@ -375,6 +375,12 @@ function playCard(gameState, playerId, cardToPlay, chosenColor = null) {
         return { error: 'Game is already over' };
     }
     
+    // CRITICAL BUG FIX: Prevent playing cards from hand while in limbo state
+    // This prevents the "Ghost Card" bug where playableDrawnCard state persists incorrectly
+    if (gameState.playableDrawnCard) {
+        return { error: 'You must first play or keep the card you just drew. You cannot play other cards from your hand at this time.' };
+    }
+    
     // Validate it's the player's turn
     const currentPlayer = gameState.players[gameState.currentPlayerIndex];
     if (!currentPlayer || currentPlayer.id !== playerId) {
