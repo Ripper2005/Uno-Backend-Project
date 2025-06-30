@@ -329,9 +329,9 @@ function createGameState(playerIds) {
     const discardPile = [remainingDeck.shift()];
     const drawPile = remainingDeck;
     
-    // Ensure first card is not a wild card
+    // Ensure first card is not a wild card or action card
     let firstCard = discardPile[0];
-    while (firstCard.type === 'wild') {
+    while (firstCard.type === 'wild' || firstCard.type === 'action') {
         drawPile.push(firstCard);
         shuffleDeck(drawPile);
         firstCard = drawPile.shift();
@@ -405,22 +405,6 @@ function playCard(gameState, playerId, cardToPlay, chosenColor = null) {
     
     if (cardToPlay.type === 'wild' && !COLORS.includes(chosenColor)) {
         return { error: 'Invalid color choice' };
-    }
-    
-    // Validate Wild Draw 4 can only be played if no other valid cards available
-    if (cardToPlay.value === 'wild_draw4') {
-        const topCard = gameState.discardPile[gameState.discardPile.length - 1];
-        // Check if player has any cards that match the current color or top card value
-        const hasMatchingCard = currentPlayer.hand.some(card => {
-            if (card.type === 'wild') {
-                return false; // Don't count other wild cards
-            }
-            return card.color === gameState.currentColor || card.value === topCard.value;
-        });
-        
-        if (hasMatchingCard) {
-            return { error: 'Wild Draw 4 can only be played when you have no cards matching the current color' };
-        }
     }
     
     // Create new game state with deep copies
@@ -539,12 +523,18 @@ function playDrawnCard(gameState, playerId, chosenColor = null) {
         return { error: 'Not your turn' };
     }
     
-    // Validate playableDrawnCard exists
-    if (!gameState.playableDrawnCard) {
+    // Validate player is in limbo state
+    if (!gameState.playableDrawnCard || gameState.playableDrawnCard.playerId !== playerId) {
         return { error: 'No drawn card available to play' };
     }
     
-    const cardToPlay = gameState.playableDrawnCard;
+    const cardToPlay = gameState.playableDrawnCard.card;
+    
+    // Validate the move is legal
+    const topCard = gameState.discardPile[gameState.discardPile.length - 1];
+    if (!isMoveValid(cardToPlay, topCard, gameState.currentColor)) {
+        return { error: 'Invalid move - card does not match color, number, or symbol' };
+    }
     
     // Validate wild card has chosen color
     if (cardToPlay.type === 'wild' && !chosenColor) {
@@ -553,22 +543,6 @@ function playDrawnCard(gameState, playerId, chosenColor = null) {
     
     if (cardToPlay.type === 'wild' && !COLORS.includes(chosenColor)) {
         return { error: 'Invalid color choice' };
-    }
-    
-    // Validate Wild Draw 4 can only be played if no other valid cards available
-    if (cardToPlay.value === 'wild_draw4') {
-        const topCard = gameState.discardPile[gameState.discardPile.length - 1];
-        // Check if player has any cards that match the current color or top card value
-        const hasMatchingCard = currentPlayer.hand.some(card => {
-            if (card.type === 'wild') {
-                return false; // Don't count other wild cards
-            }
-            return card.color === gameState.currentColor || card.value === topCard.value;
-        });
-        
-        if (hasMatchingCard) {
-            return { error: 'Wild Draw 4 can only be played when you have no cards matching the current color' };
-        }
     }
     
     // Create new game state with deep copies

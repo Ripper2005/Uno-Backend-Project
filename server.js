@@ -248,12 +248,20 @@ app.post('/api/auth/login', (req, res) => {
  */
 app.post('/api/rooms/create', (req, res) => {
     try {
-        const { playerId } = req.body;
+        const { playerId, maxPlayers } = req.body;
         
         // Validate request body
         if (!playerId || typeof playerId !== 'string' || playerId.trim() === '') {
             return res.status(400).json({
                 error: 'Invalid or missing playerId'
+            });
+        }
+        
+        // Validate maxPlayers parameter
+        const playerLimit = maxPlayers || 4; // Default to 4 if not specified
+        if (typeof playerLimit !== 'number' || playerLimit < 2 || playerLimit > 10) {
+            return res.status(400).json({
+                error: 'maxPlayers must be a number between 2 and 10'
             });
         }
         
@@ -267,6 +275,7 @@ app.post('/api/rooms/create', (req, res) => {
             players: [{ id: playerId.trim(), hand: [] }],
             status: 'waiting', // 'waiting', 'playing', 'finished'
             gameState: null, // Will be created when game starts
+            maxPlayers: playerLimit, // Use the requested player limit
             createdAt: new Date()
         };
         
@@ -329,10 +338,10 @@ app.post('/api/rooms/:roomId/join', (req, res) => {
             });
         }
         
-        // Check room capacity (max 10 players for UNO)
-        if (room.players.length >= 10) {
+        // Check room capacity using the room's maxPlayers property
+        if (room.players.length >= room.maxPlayers) {
             return res.status(400).json({
-                error: 'Room is full (maximum 10 players)'
+                error: `Room is full (maximum ${room.maxPlayers} players)`
             });
         }
           // Add player to the room
@@ -408,7 +417,7 @@ app.get('/api/rooms', (req, res) => {
                 status: room.status,
                 host: room.host,
                 playerCount: room.players.length,
-                maxPlayers: 10,
+                maxPlayers: room.maxPlayers,
                 currentPlayer: room.gameState ? room.gameState.players[room.gameState.currentPlayerIndex]?.id : null,
                 isGameOver: room.gameState ? room.gameState.isGameOver : false
             };
@@ -843,9 +852,23 @@ function handlePlayerDisconnect(roomId, playerId, socket) {
                 // Mark player as inactive
                 room.gameState.players[playerIndex].isActive = false;
                 
+                // Clear any limbo state if disconnected player was in limbo
+                if (room.gameState.playableDrawnCard && room.gameState.playableDrawnCard.playerId === playerId) {
+                    room.gameState.playableDrawnCard = null;
+                }
+                
                 // If it was the disconnected player's turn, advance to next active player
-                if (room.gameState.currentPlayerIndex === playerIndex) {
-                    room.gameState.currentPlayerIndex = getNextActivePlayerIndex(room.gameState);
+                const wasCurrentPlayer = room.gameState.currentPlayerIndex === playerIndex;
+                if (wasCurrentPlayer) {
+                    const nextPlayerIndex = getNextActivePlayerIndex(room.gameState);
+                    room.gameState.currentPlayerIndex = nextPlayerIndex;
+                    
+                    // Broadcast turn change to inform all players
+                    socket.to(roomId).emit('turnChanged', {
+                        currentPlayerIndex: nextPlayerIndex,
+                        currentPlayerId: room.gameState.players[nextPlayerIndex]?.id,
+                        reason: 'Player disconnected'
+                    });
                 }
                 
                 // Check if only one active player remains
@@ -934,7 +957,7 @@ function getRoomStateForClient(room) {
             host: room.host,
             players: room.players.map(player => enrichPlayerData({ id: player.id })),
             playerCount: room.players.length,
-            maxPlayers: 10,
+            maxPlayers: room.maxPlayers,
             canStart: room.players.length >= 2
         };
     } else if (room.status === 'playing' && room.gameState) {
