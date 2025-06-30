@@ -490,7 +490,10 @@ function drawCard(gameState, playerId) {
     
     if (isPlayable) {
         // Enter "limbo state" - card is playable, let player choose
-        newState.playableDrawnCard = { ...drawnCard };
+        newState.playableDrawnCard = {
+            card: { ...drawnCard },
+            playerId: playerId
+        };
         // Don't add to hand, don't end turn
         return newState;
     } else {
@@ -599,8 +602,8 @@ function passDrawnCard(gameState, playerId) {
         return { error: 'Not your turn' };
     }
     
-    // Validate playableDrawnCard exists
-    if (!gameState.playableDrawnCard) {
+    // Validate playableDrawnCard exists and belongs to this player
+    if (!gameState.playableDrawnCard || gameState.playableDrawnCard.playerId !== playerId) {
         return { error: 'No drawn card available to pass' };
     }
     
@@ -614,7 +617,7 @@ function passDrawnCard(gameState, playerId) {
     newState.discardPile = [...gameState.discardPile];
     
     // Add the drawn card to the current player's hand
-    const drawnCard = gameState.playableDrawnCard;
+    const drawnCard = gameState.playableDrawnCard.card;
     newState.players[newState.currentPlayerIndex].hand.push(drawnCard);
     
     // Clear the playableDrawnCard (exit limbo state)
