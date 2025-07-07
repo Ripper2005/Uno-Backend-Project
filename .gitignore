@@ -1,6 +1,7 @@
 # Ignore the node_modules folder
 node_modules
 tests
+tests(u can ignore this)/
 
 # Ignore test output and temporary files
 *.log

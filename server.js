@@ -783,6 +783,31 @@ io.on('connection', (socket) => {
         }
     });
     
+    // Handle intentional player leaving
+    socket.on('leaveRoom', ({ roomId, playerId, reason }) => {
+        try {
+            console.log(`Player ${playerId} intentionally leaving room ${roomId} (reason: ${reason})`);
+            
+            // Validate player
+            if (playerId !== socket.playerId || roomId !== socket.roomId) {
+                socket.emit('error', { message: 'Invalid leave request' });
+                return;
+            }
+            
+            // Use the same disconnect handling logic
+            handlePlayerDisconnect(roomId, playerId, socket, 'intentional_leave');
+            
+            // Remove socket from room
+            socket.leave(roomId);
+            socket.roomId = null;
+            socket.playerId = null;
+            
+        } catch (error) {
+            console.error('Error handling leave room:', error);
+            socket.emit('error', { message: 'Failed to leave room' });
+        }
+    });
+    
       // Handle player disconnect
     socket.on('disconnect', () => {
         console.log(`Socket disconnected: ${socket.id}`);
@@ -807,8 +832,9 @@ io.on('connection', (socket) => {
  * @param {string} roomId - The room ID the player was in
  * @param {string} playerId - The ID of the disconnected player
  * @param {Object} socket - The socket object for broadcasting
+ * @param {string} reason - The reason for disconnection ('disconnect' or 'intentional_leave')
  */
-function handlePlayerDisconnect(roomId, playerId, socket) {
+function handlePlayerDisconnect(roomId, playerId, socket, reason = 'disconnect') {
     try {
         const room = activeGames[roomId];
         if (!room) {
@@ -816,7 +842,8 @@ function handlePlayerDisconnect(roomId, playerId, socket) {
             return;
         }
 
-        console.log(`Player ${playerId} disconnected from room ${roomId}`);
+        const isIntentionalLeave = reason === 'intentional_leave';
+        console.log(`Player ${playerId} ${isIntentionalLeave ? 'left' : 'disconnected from'} room ${roomId}`);
         
         if (room.status === 'waiting') {
             // Game hasn't started - remove player from room
@@ -841,7 +868,7 @@ function handlePlayerDisconnect(roomId, playerId, socket) {
             socket.to(roomId).emit('gameUpdate', roomState);
             socket.to(roomId).emit('playerDisconnected', { 
                 playerId,
-                message: `${playerId} has left the room`
+                message: isIntentionalLeave ? `${playerId} has left the room` : `${playerId} has disconnected`
             });
             
         } else if (room.status === 'playing' && room.gameState) {
@@ -881,10 +908,10 @@ function handlePlayerDisconnect(roomId, playerId, socket) {
                     
                     socket.to(roomId).emit('gameOver', {
                         winnerId: room.gameState.winner,
-                        reason: 'Other players disconnected',
+                        reason: isIntentionalLeave ? 'Player forfeited' : 'Other players disconnected',
                         message: room.gameState.winner ? 
-                            `${room.gameState.winner} wins by default!` : 
-                            'Game ended - all players disconnected'
+                            `🎉 ${room.gameState.winner} wins by default!` : 
+                            'Game ended - all players have left'
                     });
                 }
                 
@@ -893,7 +920,9 @@ function handlePlayerDisconnect(roomId, playerId, socket) {
                 socket.to(roomId).emit('gameUpdate', roomState);
                 socket.to(roomId).emit('playerDisconnected', { 
                     playerId,
-                    message: `${playerId} has disconnected and will be skipped`
+                    message: isIntentionalLeave ? 
+                        `${playerId} has forfeited the game and will be skipped` : 
+                        `${playerId} has disconnected and will be skipped`
                 });
             }
         }
