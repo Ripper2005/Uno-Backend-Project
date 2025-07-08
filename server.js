@@ -46,19 +46,8 @@ const dbPool = mysql.createPool({
   queueLimit: 0
 });
 
-/**
- * In-memory storage for active games
- * Structure: {
- *   roomId: {
- *     roomId: string,
- *     host: string (playerId),
- *     players: Array<{id: string, hand: Array<Card>}>,
- *     status: 'waiting' | 'playing' | 'finished',
- *     gameState: GameState | null,
- *     createdAt: Date
- *   }
- * }
- */
+// In-memory cache for active games (in_progress status)
+// This provides fast access during gameplay while maintaining database persistence
 let activeGames = {};
 
 // Server configuration
@@ -74,7 +63,6 @@ app.use(express.json());
 
 /**
  * Generates a unique 6-character room ID using alphanumeric characters
- * Recursively generates new IDs if collision occurs (though very unlikely)
  * @returns {string} Unique room ID (e.g., "ABC123")
  */
 function generateRoomId() {
@@ -83,11 +71,50 @@ function generateRoomId() {
     for (let i = 0; i < 6; i++) {
         result += characters.charAt(Math.floor(Math.random() * characters.length));
     }
-    // Ensure uniqueness by checking against existing rooms
-    if (activeGames[result]) {
-        return generateRoomId(); // Recursive call if ID already exists
-    }
     return result;
+}
+
+/**
+ * Load active games from database into cache on server startup
+ */
+async function loadActiveGamesIntoCache() {
+    try {
+        const [gameRows] = await dbPool.execute(
+            'SELECT room_code, game_state FROM games WHERE status = ?',
+            ['in_progress']
+        );
+        
+        for (const gameData of gameRows) {
+            const gameState = gameData.game_state;
+            // Only load if it's a proper game state (not lobby state)
+            if (gameState.players && gameState.currentPlayerIndex !== undefined) {
+                activeGames[gameData.room_code] = gameState;
+                console.log(`Loaded game ${gameData.room_code} into cache`);
+            }
+        }
+        
+        console.log(`Loaded ${Object.keys(activeGames).length} active games into cache`);
+    } catch (error) {
+        console.error('Error loading active games into cache:', error);
+    }
+}
+
+/**
+ * Gets the numeric user ID for a username
+ * @param {string} username - The username to look up
+ * @returns {number|null} The user ID or null if not found
+ */
+async function getUserId(username) {
+    try {
+        const [userRows] = await dbPool.execute(
+            'SELECT id FROM users WHERE username = ?',
+            [username]
+        );
+        return userRows.length > 0 ? userRows[0].id : null;
+    } catch (error) {
+        console.error('Error fetching user ID:', error);
+        return null;
+    }
 }
 
 // ============================================================================
@@ -98,12 +125,27 @@ function generateRoomId() {
  * GET /api/status
  * Returns server status and basic statistics
  */
-app.get('/api/status', (req, res) => {
-    res.json({
-        status: 'ok',
-        message: 'Server is running',
-        activeRooms: Object.keys(activeGames).length
-    });
+app.get('/api/status', async (req, res) => {
+    try {
+        // Count active games from database
+        const [gameRows] = await dbPool.execute(
+            'SELECT COUNT(*) as count FROM games WHERE status IN (?, ?)',
+            ['waiting', 'in_progress']
+        );
+        
+        res.json({
+            status: 'ok',
+            message: 'Server is running',
+            activeRooms: gameRows[0].count
+        });
+    } catch (error) {
+        console.error('Error getting server status:', error);
+        res.json({
+            status: 'ok',
+            message: 'Server is running',
+            activeRooms: 0
+        });
+    }
 });
 
 // ============================================================================
@@ -337,10 +379,11 @@ app.post('/api/auth/update-avatar', async (req, res) => {
 /**
  * POST /api/rooms/create
  * Creates a new game room with the requesting player as host
- * Body: { playerId: string }
+ * Body: { playerId: string, maxPlayers: number }
  * Returns: { roomId: string }
  */
 app.post('/api/rooms/create', async (req, res) => {
+    let connection;
     try {
         const { playerId, maxPlayers } = req.body;
         
@@ -359,66 +402,114 @@ app.post('/api/rooms/create', async (req, res) => {
             });
         }
         
-        // Fetch player profile data from database
-        const [userRows] = await dbPool.execute(
-            'SELECT username, full_name, avatar_url FROM users WHERE username = ?',
+        // Start database transaction
+        connection = await dbPool.getConnection();
+        await connection.beginTransaction();
+        
+        // Fetch user ID from database
+        const [userRows] = await connection.execute(
+            'SELECT id, username, full_name, avatar_url FROM users WHERE username = ?',
             [playerId.trim()]
         );
         
         if (userRows.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 error: 'Player not found'
             });
         }
         
-        const playerData = userRows[0];
+        const userData = userRows[0];
+        const hostUserId = userData.id;
         
-        // Generate unique room ID
-        const roomId = generateRoomId();
+        // Generate unique room code
+        let roomCode;
+        let isUnique = false;
+        let attempts = 0;
         
-        // Create initial room state (waiting for players)
-        const roomState = {
-            roomId: roomId,
+        while (!isUnique && attempts < 10) {
+            roomCode = generateRoomId();
+            const [existingRooms] = await connection.execute(
+                'SELECT id FROM games WHERE room_code = ?',
+                [roomCode]
+            );
+            if (existingRooms.length === 0) {
+                isUnique = true;
+            }
+            attempts++;
+        }
+        
+        if (!isUnique) {
+            await connection.rollback();
+            return res.status(500).json({
+                error: 'Failed to generate unique room code'
+            });
+        }
+        
+        // Create initial game state for waiting room
+        const initialGameState = {
+            status: 'waiting',
             host: playerId.trim(),
-            players: [{ 
-                id: playerId.trim(), 
-                name: playerData.full_name,
-                avatar: playerData.avatar_url,
-                hand: [] 
+            players: [{
+                id: playerId.trim(),
+                name: userData.full_name,
+                avatar: userData.avatar_url,
+                hand: []
             }],
-            status: 'waiting', // 'waiting', 'playing', 'finished'
-            gameState: null, // Will be created when game starts
-            maxPlayers: playerLimit, // Use the requested player limit
-            createdAt: new Date()
+            maxPlayers: playerLimit,
+            createdAt: new Date().toISOString()
         };
         
-        // Store the room state
-        activeGames[roomId] = roomState;
+        // Insert into games table
+        const [gameResult] = await connection.execute(
+            `INSERT INTO games (room_code, host_id, status, game_state, created_at) 
+             VALUES (?, ?, ?, ?, NOW())`,
+            [roomCode, hostUserId, 'waiting', JSON.stringify(initialGameState)]
+        );
         
-        console.log(`New room created: ${roomId} by player: ${playerId}`);
+        const newGameId = gameResult.insertId;
+        
+        // Insert host as first participant
+        await connection.execute(
+            'INSERT INTO game_participants (game_id, user_id, joined_at) VALUES (?, ?, NOW())',
+            [newGameId, hostUserId]
+        );
+        
+        // Commit transaction
+        await connection.commit();
+        
+        console.log(`New room created: ${roomCode} by player: ${playerId}`);
         
         res.status(201).json({
-            roomId: roomId
+            roomId: roomCode
         });
         
     } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
         console.error('Error creating room:', error);
         res.status(500).json({
             error: 'Failed to create room'
         });
+    } finally {
+        if (connection) {
+            connection.release();
+        }
     }
 });
 
 /**
  * POST /api/rooms/:roomId/join
- * Adds a player to an existing room and starts game if 2+ players
- * Params: roomId (string)
+ * Adds a player to an existing room
+ * Params: roomId (string) - the room_code
  * Body: { playerId: string }
  * Returns: { success: boolean, message: string, gameStarted: boolean }
  */
 app.post('/api/rooms/:roomId/join', async (req, res) => {
+    let connection;
     try {
-        const { roomId } = req.params;
+        const { roomId } = req.params; // This is the room_code
         const { playerId } = req.body;
         
         // Validate request body
@@ -428,101 +519,161 @@ app.post('/api/rooms/:roomId/join', async (req, res) => {
             });
         }
         
-        // Find the room
-        const room = activeGames[roomId];
-        if (!room) {
+        // Start database transaction
+        connection = await dbPool.getConnection();
+        await connection.beginTransaction();
+        
+        // Fetch game data
+        const [gameRows] = await connection.execute(
+            'SELECT id, room_code, host_id, status, game_state FROM games WHERE room_code = ?',
+            [roomId]
+        );
+        
+        if (gameRows.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 error: 'Room not found'
             });
         }
         
+        const gameData = gameRows[0];
+        const gameState = gameData.game_state; // MySQL automatically parses JSON columns
+        
         // Check if game has already finished
-        if (room.status === 'finished') {
+        if (gameData.status === 'completed') {
+            await connection.rollback();
             return res.status(400).json({
-                error: 'Game is already finished'
+                error: 'Game is already completed'
             });
         }
         
-        // Check if player is already in the room
-        const existingPlayer = room.players.find(player => player.id === playerId.trim());
-        if (existingPlayer) {
-            return res.status(400).json({
-                error: 'Player already in this room'
-            });
-        }
-        
-        // Check room capacity using the room's maxPlayers property
-        if (room.players.length >= room.maxPlayers) {
-            return res.status(400).json({
-                error: `Room is full (maximum ${room.maxPlayers} players)`
-            });
-        }
-        
-        // Fetch player profile data from database
-        const [userRows] = await dbPool.execute(
-            'SELECT username, full_name, avatar_url FROM users WHERE username = ?',
+        // Fetch joining player's data
+        const [userRows] = await connection.execute(
+            'SELECT id, username, full_name, avatar_url FROM users WHERE username = ?',
             [playerId.trim()]
         );
         
         if (userRows.length === 0) {
+            await connection.rollback();
             return res.status(404).json({
                 error: 'Player not found'
             });
         }
         
-        const playerData = userRows[0];
+        const userData = userRows[0];
+        const joiningUserId = userData.id;
         
-        // Add player to the room
-        room.players.push({
+        // Check if player is already in the game
+        const [participantRows] = await connection.execute(
+            'SELECT user_id FROM game_participants WHERE game_id = ? AND user_id = ?',
+            [gameData.id, joiningUserId]
+        );
+        
+        if (participantRows.length > 0) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: 'Player already in this room'
+            });
+        }
+        
+        // Check room capacity
+        const [participantCountRows] = await connection.execute(
+            'SELECT COUNT(*) as count FROM game_participants WHERE game_id = ?',
+            [gameData.id]
+        );
+        
+        const currentPlayerCount = participantCountRows[0].count;
+        if (currentPlayerCount >= gameState.maxPlayers) {
+            await connection.rollback();
+            return res.status(400).json({
+                error: `Room is full (maximum ${gameState.maxPlayers} players)`
+            });
+        }
+        
+        // Add player to game_participants
+        await connection.execute(
+            'INSERT INTO game_participants (game_id, user_id, joined_at) VALUES (?, ?, NOW())',
+            [gameData.id, joiningUserId]
+        );
+        
+        // Update game state to include new player
+        gameState.players.push({
             id: playerId.trim(),
-            name: playerData.full_name,
-            avatar: playerData.avatar_url,
+            name: userData.full_name,
+            avatar: userData.avatar_url,
             hand: []
         });
         
+        // Update game state in database
+        await connection.execute(
+            'UPDATE games SET game_state = ? WHERE id = ?',
+            [JSON.stringify(gameState), gameData.id]
+        );
+        
+        // Commit transaction
+        await connection.commit();
+        
         // Broadcast updated room state to all connected clients in the room
-        io.to(roomId).emit('gameUpdate', getRoomStateForClient(room));
+        io.to(roomId).emit('gameUpdate', getRoomStateForClient(gameState, roomId));
         
-        // Note: Game will be started via WebSocket 'startGame' event
-        // Auto-start removed to allow manual game initiation
-        
-        console.log(`Player ${playerId} joined room: ${roomId} (${room.players.length} players total)`);
+        console.log(`Player ${playerId} joined room: ${roomId} (${gameState.players.length} players total)`);
         
         res.json({
             success: true,
             message: 'Player joined successfully',
             gameStarted: false,
-            canStart: room.players.length >= 2
+            canStart: gameState.players.length >= 2
         });
         
     } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
         console.error('Error joining room:', error);
         res.status(500).json({
             error: 'Failed to join room'
         });
+    } finally {
+        if (connection) {
+            connection.release();
+        }
     }
 });
 
 /**
  * GET /api/rooms/:roomId
  * Returns the current state of a specific game room with enriched player data
- * Params: roomId (string)
+ * Params: roomId (string) - the room_code
  * Returns: Room state object with player info, game status, etc.
  */
-app.get('/api/rooms/:roomId', (req, res) => {
+app.get('/api/rooms/:roomId', async (req, res) => {
     try {
-        const { roomId } = req.params;
+        const { roomId } = req.params; // This is the room_code
         
-        // Find the room
-        const room = activeGames[roomId];
-        if (!room) {
+        // First check if game is in cache (for active games)
+        if (activeGames[roomId]) {
+            const roomState = getRoomStateForClient(activeGames[roomId], roomId);
+            res.json(roomState);
+            return;
+        }
+        
+        // If not in cache, fetch from database
+        const [gameRows] = await dbPool.execute(
+            'SELECT room_code, status, game_state FROM games WHERE room_code = ?',
+            [roomId]
+        );
+        
+        if (gameRows.length === 0) {
             return res.status(404).json({
                 error: 'Room not found'
             });
         }
         
-        // Use the same enriched function as WebSocket events
-        const roomState = getRoomStateForClient(room);
+        const gameData = gameRows[0];
+        const gameState = gameData.game_state; // MySQL automatically parses JSON columns
+        
+        // Use the enriched function to format for client
+        const roomState = getRoomStateForClient(gameState, roomId);
         res.json(roomState);
         
     } catch (error) {
@@ -539,24 +690,42 @@ app.get('/api/rooms/:roomId', (req, res) => {
  * Useful for debugging and admin purposes
  * Returns: { totalRooms: number, rooms: Array<RoomSummary> }
  */
-app.get('/api/rooms', (req, res) => {
+app.get('/api/rooms', async (req, res) => {
     try {
-        const rooms = Object.keys(activeGames).map(roomId => {
-            const room = activeGames[roomId];
+        // Get rooms from cache (active games)
+        const cachedRooms = Object.entries(activeGames).map(([roomId, gameState]) => ({
+            roomId: roomId,
+            status: 'in_progress',
+            playerCount: gameState.players ? gameState.players.length : 0,
+            currentPlayer: gameState.players ? gameState.players[gameState.currentPlayerIndex]?.id : null,
+            isGameOver: gameState.isGameOver || false
+        }));
+        
+        // Fetch waiting/lobby games from database
+        const [gameRows] = await dbPool.execute(
+            'SELECT room_code, status, game_state FROM games WHERE status IN (?, ?)',
+            ['waiting', 'completed']
+        );
+        
+        const dbRooms = gameRows.map(gameData => {
+            const gameState = gameData.game_state; // MySQL automatically parses JSON columns
             return {
-                roomId: roomId,
-                status: room.status,
-                host: room.host,
-                playerCount: room.players.length,
-                maxPlayers: room.maxPlayers,
-                currentPlayer: room.gameState ? room.gameState.players[room.gameState.currentPlayerIndex]?.id : null,
-                isGameOver: room.gameState ? room.gameState.isGameOver : false
+                roomId: gameData.room_code,
+                status: gameData.status,
+                playerCount: gameState.players ? gameState.players.length : 0,
+                maxPlayers: gameState.maxPlayers || 4,
+                host: gameState.host,
+                currentPlayer: null,
+                isGameOver: gameData.status === 'completed'
             };
         });
         
+        // Combine cached and database rooms
+        const allRooms = [...cachedRooms, ...dbRooms];
+        
         res.json({
-            totalRooms: rooms.length,
-            rooms: rooms
+            totalRooms: allRooms.length,
+            rooms: allRooms
         });
         
     } catch (error) {
@@ -570,30 +739,56 @@ app.get('/api/rooms', (req, res) => {
 /**
  * GET /api/rooms/:roomId/hand/:playerId
  * Returns a specific player's hand in a game room
- * Params: roomId (string), playerId (string)
+ * Params: roomId (string) - room_code, playerId (string)
  * Returns: { playerId: string, hand: Array<Card> }
  */
-app.get('/api/rooms/:roomId/hand/:playerId', (req, res) => {
+app.get('/api/rooms/:roomId/hand/:playerId', async (req, res) => {
     try {
-        const { roomId, playerId } = req.params;
+        const { roomId, playerId } = req.params; // roomId is room_code
         
-        // Find the room
-        const room = activeGames[roomId];
-        if (!room) {
+        // First check if game is in cache (for active games)
+        if (activeGames[roomId]) {
+            const gameState = activeGames[roomId];
+            
+            // Find the player
+            const player = gameState.players.find(p => p.id === playerId);
+            if (!player) {
+                return res.status(404).json({
+                    error: 'Player not found in this room'
+                });
+            }
+            
+            res.json({
+                playerId: playerId,
+                hand: player.hand
+            });
+            return;
+        }
+        
+        // If not in cache, fetch from database
+        const [gameRows] = await dbPool.execute(
+            'SELECT status, game_state FROM games WHERE room_code = ?',
+            [roomId]
+        );
+        
+        if (gameRows.length === 0) {
             return res.status(404).json({
                 error: 'Room not found'
             });
         }
         
+        const gameData = gameRows[0];
+        const gameState = gameData.game_state; // MySQL automatically parses JSON columns
+        
         // Check if game is playing
-        if (room.status !== 'playing' || !room.gameState) {
+        if (gameData.status !== 'in_progress') {
             return res.status(400).json({
                 error: 'Game is not in progress'
             });
         }
         
         // Find the player
-        const player = room.gameState.players.find(p => p.id === playerId);
+        const player = gameState.players ? gameState.players.find(p => p.id === playerId) : null;
         if (!player) {
             return res.status(404).json({
                 error: 'Player not found in this room'
@@ -602,7 +797,7 @@ app.get('/api/rooms/:roomId/hand/:playerId', (req, res) => {
         
         res.json({
             playerId: playerId,
-            hand: player.hand
+            hand: player.hand || []
         });
         
     } catch (error) {
@@ -632,17 +827,51 @@ io.on('connection', (socket) => {
     console.log(`Socket connected: ${socket.id}`);
     
     // Join a specific room
-    socket.on('joinRoom', ({ roomId, playerId }) => {
+    socket.on('joinRoom', async ({ roomId, playerId }) => {
         try {
-            // Validate room exists
-            const room = activeGames[roomId];
-            if (!room) {
+            // First check if game is in cache (for active games)
+            if (activeGames[roomId]) {
+                const gameState = activeGames[roomId];
+                
+                // Validate player is in the room
+                const playerInRoom = gameState.players.find(player => player.id === playerId);
+                if (!playerInRoom) {
+                    socket.emit('error', { message: 'Player not in this room' });
+                    return;
+                }
+                
+                // Join the socket.io room
+                socket.join(roomId);
+                socket.playerId = playerId;
+                socket.roomId = roomId;
+                
+                console.log(`Player ${playerId} joined socket room ${roomId} (from cache)`);
+                
+                // Send current room state to the joining player
+                const roomState = getRoomStateForClient(gameState, roomId);
+                socket.emit('gameUpdate', roomState);
+                
+                // Notify other players in the room
+                socket.to(roomId).emit('playerConnected', { playerId });
+                return;
+            }
+            
+            // If not in cache, validate room exists in database
+            const [gameRows] = await dbPool.execute(
+                'SELECT room_code, status, game_state FROM games WHERE room_code = ?',
+                [roomId]
+            );
+            
+            if (gameRows.length === 0) {
                 socket.emit('error', { message: 'Room not found' });
                 return;
             }
             
+            const gameData = gameRows[0];
+            const gameState = gameData.game_state; // MySQL automatically parses JSON columns
+            
             // Validate player is in the room
-            const playerInRoom = room.players.find(player => player.id === playerId);
+            const playerInRoom = gameState.players.find(player => player.id === playerId);
             if (!playerInRoom) {
                 socket.emit('error', { message: 'Player not in this room' });
                 return;
@@ -653,10 +882,10 @@ io.on('connection', (socket) => {
             socket.playerId = playerId;
             socket.roomId = roomId;
             
-            console.log(`Player ${playerId} joined socket room ${roomId}`);
+            console.log(`Player ${playerId} joined socket room ${roomId} (from database)`);
             
             // Send current room state to the joining player
-            const roomState = getRoomStateForClient(room);
+            const roomState = getRoomStateForClient(gameState, roomId);
             socket.emit('gameUpdate', roomState);
             
             // Notify other players in the room
@@ -669,38 +898,69 @@ io.on('connection', (socket) => {
     });
     
     // Update player avatar in lobby
-    socket.on('updatePlayerAvatar', ({ roomId, playerId, avatar }) => {
+    socket.on('updatePlayerAvatar', async ({ roomId, playerId, avatar }) => {
+        let connection;
         try {
-            // Validate room exists
-            const room = activeGames[roomId];
-            if (!room) {
+            // Start database transaction
+            connection = await dbPool.getConnection();
+            await connection.beginTransaction();
+            
+            // Fetch game from database
+            const [gameRows] = await connection.execute(
+                'SELECT id, room_code, status, game_state FROM games WHERE room_code = ?',
+                [roomId]
+            );
+            
+            if (gameRows.length === 0) {
+                await connection.rollback();
                 socket.emit('error', { message: 'Room not found' });
                 return;
             }
             
+            const gameData = gameRows[0];
+            const gameState = gameData.game_state; // MySQL automatically parses JSON columns
+            
             // Validate player is in the room
-            const playerInRoom = room.players.find(player => player.id === playerId);
+            const playerInRoom = gameState.players.find(player => player.id === playerId);
             if (!playerInRoom) {
+                await connection.rollback();
                 socket.emit('error', { message: 'Player not in this room' });
                 return;
             }
             
-            // Update the player's avatar in the room state
+            // Update the player's avatar in the game state
             playerInRoom.avatar = avatar;
+            
+            // Update game state in database
+            await connection.execute(
+                'UPDATE games SET game_state = ? WHERE id = ?',
+                [JSON.stringify(gameState), gameData.id]
+            );
+            
+            // Commit transaction
+            await connection.commit();
             
             console.log(`Player ${playerId} updated avatar in room ${roomId}`);
             
             // Send updated room state to all players in the room
-            const roomState = getRoomStateForClient(room);
+            const roomState = getRoomStateForClient(gameState, roomId);
             io.to(roomId).emit('gameUpdate', roomState);
             
         } catch (error) {
+            if (connection) {
+                await connection.rollback();
+            }
             console.error('Error in updatePlayerAvatar:', error);
             socket.emit('error', { message: 'Failed to update avatar' });
+        } finally {
+            if (connection) {
+                connection.release();
+            }
         }
     });
       // Start the game (only host can do this)
-    socket.on('startGame', ({ roomId }) => {
+    socket.on('startGame', async ({ roomId }) => {
+        let connection;
         try {
             console.log(`StartGame event received for room ${roomId} from socket ${socket.id}`);
             
@@ -710,76 +970,115 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // Look up the game state in activeGames
-            const room = activeGames[roomId];
-            if (!room) {
+            // Start database transaction
+            connection = await dbPool.getConnection();
+            await connection.beginTransaction();
+            
+            // Fetch game data from database
+            const [gameRows] = await connection.execute(
+                'SELECT id, room_code, status, game_state FROM games WHERE room_code = ?',
+                [roomId]
+            );
+            
+            if (gameRows.length === 0) {
+                await connection.rollback();
                 socket.emit('error', { message: 'Room not found' });
                 return;
             }
             
+            const gameData = gameRows[0];
+            const lobbyState = gameData.game_state; // This contains the lobby/waiting room state
+            
             // Validate that socket player is in the room
             if (!socket.playerId) {
+                await connection.rollback();
                 socket.emit('error', { message: 'Player not identified' });
                 return;
             }
             
             // Check if player is the host
-            if (room.host !== socket.playerId) {
+            if (lobbyState.host !== socket.playerId) {
+                await connection.rollback();
                 socket.emit('error', { message: 'Only the host can start the game' });
                 return;
             }
             
-            // Ensure there are at least 2 players
-            if (room.players.length < 2) {
+            // Validate number of participants in database
+            const [participantCountRows] = await connection.execute(
+                'SELECT COUNT(*) as count FROM game_participants WHERE game_id = ?',
+                [gameData.id]
+            );
+            
+            const participantCount = participantCountRows[0].count;
+            if (participantCount < 2) {
+                await connection.rollback();
                 socket.emit('error', { message: 'Need at least 2 players to start the game' });
                 return;
             }
             
             // Check if game has already started
-            if (room.status !== 'waiting') {
-                socket.emit('error', { message: 'Game has already started or finished' });
+            if (gameData.status !== 'waiting') {
+                await connection.rollback();
+                socket.emit('error', { message: 'Game has already started or completed' });
                 return;
             }
             
-            // Extract player IDs from the room
-            const playerIds = room.players.map(player => player.id);
+            // Extract player IDs from the lobby state
+            const playerIds = lobbyState.players.map(player => player.id);
             console.log(`Starting game with players: ${playerIds.join(', ')}`);
             
             // Call GameEngine to create the official game state
-            const initialGameState = GameEngine.createGameState(playerIds);
+            const gameState = GameEngine.createGameState(playerIds);
             
-            // Update the room with the complete game state
-            room.gameState = initialGameState;
-            room.status = 'playing';
+            // Store the complete game state in the cache for fast access
+            activeGames[roomId] = gameState;
+            
+            // Update the database with the new game state and status
+            await connection.execute(
+                'UPDATE games SET status = ?, game_state = ? WHERE id = ?',
+                ['in_progress', JSON.stringify(gameState), gameData.id]
+            );
+            
+            // Commit transaction
+            await connection.commit();
             
             console.log(`Game officially started in room ${roomId} with ${playerIds.length} players`);
-            console.log(`Current player: ${initialGameState.players[initialGameState.currentPlayerIndex].id}`);
+            console.log(`Current player: ${gameState.players[gameState.currentPlayerIndex].id}`);
             
             // Broadcast gameUpdate to all clients in the room
-            const roomStateForClients = getRoomStateForClient(room);
+            const roomStateForClients = getRoomStateForClient(gameState, roomId);
             io.to(roomId).emit('gameUpdate', roomStateForClients);
             
             // Also send a specific gameStarted event
             io.to(roomId).emit('gameStarted', { 
                 message: 'Game has started! Cards have been dealt.',
-                currentPlayer: initialGameState.players[initialGameState.currentPlayerIndex].id,
-                topCard: initialGameState.discardPile[initialGameState.discardPile.length - 1]
+                currentPlayer: gameState.players[gameState.currentPlayerIndex].id,
+                topCard: gameState.discardPile[gameState.discardPile.length - 1]
             });
             
             console.log(`Game update broadcasted to all clients in room ${roomId}`);
             
         } catch (error) {
+            if (connection) {
+                await connection.rollback();
+            }
             console.error('Error starting game:', error);
             socket.emit('error', { message: 'Failed to start game: ' + error.message });
+        } finally {
+            if (connection) {
+                connection.release();
+            }
         }
     });
     
     // Handle card play
-    socket.on('playCard', ({ roomId, playerId, card, chosenColor }) => {
+    socket.on('playCard', async ({ roomId, playerId, card, chosenColor }) => {
         try {
-            const room = activeGames[roomId];
-            if (!room || !room.gameState) {
-                socket.emit('error', { message: 'Game not found or not started' });
+            // Get current game state from cache
+            const gameState = activeGames[roomId];
+            
+            if (!gameState) {
+                socket.emit('error', { message: 'Game not found in cache' });
                 return;
             }
             
@@ -790,31 +1089,44 @@ io.on('connection', (socket) => {
             }
             
             // Use GameEngine to validate and process the move
-            const result = GameEngine.playCard(room.gameState, playerId, card, chosenColor);
+            const result = GameEngine.playCard(gameState, playerId, card, chosenColor);
             
             if (result.error) {
                 socket.emit('error', { message: result.error });
                 return;
             }
             
-            // Update the game state
-            room.gameState = result;
+            // Update the cache immediately
+            activeGames[roomId] = result;
             
             console.log(`Player ${playerId} played card: ${card.color} ${card.value}`);
             
             // Check if game is over
             if (result.isGameOver) {
-                room.status = 'finished';
                 console.log(`Game over! Winner: ${result.winner}`);
+                
+                // Update player statistics asynchronously
+                const allPlayerIds = result.players.map(player => player.id);
+                updatePlayerStats(result.winner, allPlayerIds).catch(error => {
+                    console.error('Error updating player statistics:', error);
+                });
+                
+                // Remove from cache when game ends
+                delete activeGames[roomId];
                 io.to(roomId).emit('gameOver', { 
                     winnerId: result.winner,
                     message: `${result.winner} wins the game!`
                 });
             }
             
-            // Broadcast updated game state to all players
-            const roomState = getRoomStateForClient(room);
+            // Broadcast updated game state to all players immediately
+            const roomState = getRoomStateForClient(result, roomId);
             io.to(roomId).emit('gameUpdate', roomState);
+            
+            // Asynchronously update database (write-behind cache)
+            updateGameStateInDB(roomId, result).catch(error => {
+                console.error('Error updating database:', error);
+            });
             
         } catch (error) {
             console.error('Error playing card:', error);
@@ -823,11 +1135,13 @@ io.on('connection', (socket) => {
     });
     
     // Handle card draw
-    socket.on('drawCard', ({ roomId, playerId }) => {
+    socket.on('drawCard', async ({ roomId, playerId }) => {
         try {
-            const room = activeGames[roomId];
-            if (!room || !room.gameState) {
-                socket.emit('error', { message: 'Game not found or not started' });
+            // Get current game state from cache
+            const gameState = activeGames[roomId];
+            
+            if (!gameState) {
+                socket.emit('error', { message: 'Game not found in cache' });
                 return;
             }
             
@@ -838,21 +1152,26 @@ io.on('connection', (socket) => {
             }
             
             // Use GameEngine to process the draw
-            const result = GameEngine.drawCard(room.gameState, playerId);
+            const result = GameEngine.drawCard(gameState, playerId);
             
             if (result.error) {
                 socket.emit('error', { message: result.error });
                 return;
             }
             
-            // Update the game state
-            room.gameState = result;
+            // Update the cache immediately
+            activeGames[roomId] = result;
             
             console.log(`Player ${playerId} drew a card`);
             
-            // Broadcast updated game state to all players
-            const roomState = getRoomStateForClient(room);
+            // Broadcast updated game state to all players immediately
+            const roomState = getRoomStateForClient(result, roomId);
             io.to(roomId).emit('gameUpdate', roomState);
+            
+            // Asynchronously update database (write-behind cache)
+            updateGameStateInDB(roomId, result).catch(error => {
+                console.error('Error updating database:', error);
+            });
             
         } catch (error) {
             console.error('Error drawing card:', error);
@@ -861,11 +1180,13 @@ io.on('connection', (socket) => {
     });
     
     // Handle playing a drawn card (from limbo state)
-    socket.on('playDrawnCard', ({ roomId, playerId, chosenColor }) => {
+    socket.on('playDrawnCard', async ({ roomId, playerId, chosenColor }) => {
         try {
-            const room = activeGames[roomId];
-            if (!room || !room.gameState) {
-                socket.emit('error', { message: 'Game not found or not started' });
+            // Get current game state from cache
+            const gameState = activeGames[roomId];
+            
+            if (!gameState) {
+                socket.emit('error', { message: 'Game not found in cache' });
                 return;
             }
             
@@ -876,31 +1197,44 @@ io.on('connection', (socket) => {
             }
             
             // Use GameEngine to process playing the drawn card
-            const result = GameEngine.playDrawnCard(room.gameState, playerId, chosenColor);
+            const result = GameEngine.playDrawnCard(gameState, playerId, chosenColor);
             
             if (result.error) {
                 socket.emit('error', { message: result.error });
                 return;
             }
             
-            // Update the game state
-            room.gameState = result;
+            // Update the cache immediately
+            activeGames[roomId] = result;
             
             console.log(`Player ${playerId} played their drawn card`);
             
             // Check if game is over
             if (result.isGameOver) {
-                room.status = 'finished';
                 console.log(`Game over! Winner: ${result.winner}`);
+                
+                // Update player statistics asynchronously
+                const allPlayerIds = result.players.map(player => player.id);
+                updatePlayerStats(result.winner, allPlayerIds).catch(error => {
+                    console.error('Error updating player statistics:', error);
+                });
+                
+                // Remove from cache when game ends
+                delete activeGames[roomId];
                 io.to(roomId).emit('gameOver', { 
                     winnerId: result.winner,
                     message: `${result.winner} wins the game!`
                 });
             }
             
-            // Broadcast updated game state to all players
-            const roomState = getRoomStateForClient(room);
+            // Broadcast updated game state to all players immediately
+            const roomState = getRoomStateForClient(result, roomId);
             io.to(roomId).emit('gameUpdate', roomState);
+            
+            // Asynchronously update database (write-behind cache)
+            updateGameStateInDB(roomId, result).catch(error => {
+                console.error('Error updating database:', error);
+            });
             
         } catch (error) {
             console.error('Error playing drawn card:', error);
@@ -909,11 +1243,13 @@ io.on('connection', (socket) => {
     });
     
     // Handle passing on a drawn card (from limbo state)
-    socket.on('passDrawnCard', ({ roomId, playerId }) => {
+    socket.on('passDrawnCard', async ({ roomId, playerId }) => {
         try {
-            const room = activeGames[roomId];
-            if (!room || !room.gameState) {
-                socket.emit('error', { message: 'Game not found or not started' });
+            // Get current game state from cache
+            const gameState = activeGames[roomId];
+            
+            if (!gameState) {
+                socket.emit('error', { message: 'Game not found in cache' });
                 return;
             }
             
@@ -924,21 +1260,26 @@ io.on('connection', (socket) => {
             }
             
             // Use GameEngine to process passing the drawn card
-            const result = GameEngine.passDrawnCard(room.gameState, playerId);
+            const result = GameEngine.passDrawnCard(gameState, playerId);
             
             if (result.error) {
                 socket.emit('error', { message: result.error });
                 return;
             }
             
-            // Update the game state
-            room.gameState = result;
+            // Update the cache immediately
+            activeGames[roomId] = result;
             
             console.log(`Player ${playerId} passed on their drawn card`);
             
-            // Broadcast updated game state to all players
-            const roomState = getRoomStateForClient(room);
+            // Broadcast updated game state to all players immediately
+            const roomState = getRoomStateForClient(result, roomId);
             io.to(roomId).emit('gameUpdate', roomState);
+            
+            // Asynchronously update database (write-behind cache)
+            updateGameStateInDB(roomId, result).catch(error => {
+                console.error('Error updating database:', error);
+            });
             
         } catch (error) {
             console.error('Error passing drawn card:', error);
@@ -986,100 +1327,197 @@ io.on('connection', (socket) => {
 // ============================================================================
 
 /**
+ * Asynchronously updates the game state in the database (write-behind cache)
+ * @param {string} roomId - The room ID (room_code)
+ * @param {Object} gameState - The current game state from cache
+ */
+async function updateGameStateInDB(roomId, gameState) {
+    let connection;
+    try {
+        connection = await dbPool.getConnection();
+        
+        const status = gameState.isGameOver ? 'completed' : 'in_progress';
+        
+        // If game is over, get winner's user ID
+        let winnerId = null;
+        if (gameState.isGameOver && gameState.winner) {
+            winnerId = await getUserId(gameState.winner);
+        }
+        
+        await connection.execute(
+            'UPDATE games SET status = ?, game_state = ?, winner_id = ? WHERE room_code = ?',
+            [status, JSON.stringify(gameState), winnerId, roomId]
+        );
+        
+        console.log(`Database updated for room ${roomId} (status: ${status}${winnerId ? `, winner: ${gameState.winner}` : ''})`);
+        
+    } catch (error) {
+        console.error(`Error updating database for room ${roomId}:`, error);
+    } finally {
+        if (connection) {
+            connection.release();
+        }
+    }
+}
+
+/**
  * Handles player disconnection with comprehensive game state management
  * - Removes players from waiting rooms
  * - Marks players as inactive in active games
  * - Handles host transfers and room cleanup
  * - Ends games when insufficient active players remain
  * 
- * @param {string} roomId - The room ID the player was in
+ * @param {string} roomId - The room ID (room_code) the player was in
  * @param {string} playerId - The ID of the disconnected player
  * @param {Object} socket - The socket object for broadcasting
  * @param {string} reason - The reason for disconnection ('disconnect' or 'intentional_leave')
  */
-function handlePlayerDisconnect(roomId, playerId, socket, reason = 'disconnect') {
+async function handlePlayerDisconnect(roomId, playerId, socket, reason = 'disconnect') {
+    let connection;
     try {
-        const room = activeGames[roomId];
-        if (!room) {
+        // Start database transaction
+        connection = await dbPool.getConnection();
+        await connection.beginTransaction();
+        
+        // Fetch game from database
+        const [gameRows] = await connection.execute(
+            'SELECT id, room_code, status, game_state FROM games WHERE room_code = ?',
+            [roomId]
+        );
+        
+        if (gameRows.length === 0) {
+            await connection.rollback();
             console.log(`Room ${roomId} not found during disconnect`);
             return;
         }
-
+        
+        const gameData = gameRows[0];
+        const gameState = gameData.game_state; // MySQL automatically parses JSON columns
+        
         const isIntentionalLeave = reason === 'intentional_leave';
         console.log(`Player ${playerId} ${isIntentionalLeave ? 'left' : 'disconnected from'} room ${roomId}`);
         
-        if (room.status === 'waiting') {
+        if (gameData.status === 'waiting') {
             // Game hasn't started - remove player from room
-            room.players = room.players.filter(player => player.id !== playerId);
+            gameState.players = gameState.players.filter(player => player.id !== playerId);
+            
+            // Remove from game_participants table
+            const [userRows] = await connection.execute(
+                'SELECT id FROM users WHERE username = ?',
+                [playerId]
+            );
+            
+            if (userRows.length > 0) {
+                await connection.execute(
+                    'DELETE FROM game_participants WHERE game_id = ? AND user_id = ?',
+                    [gameData.id, userRows[0].id]
+                );
+            }
             
             // If host disconnected, make first remaining player the host
-            if (room.host === playerId && room.players.length > 0) {
-                room.host = room.players[0].id;
-                console.log(`New host assigned: ${room.host}`);
-                socket.to(roomId).emit('hostChanged', { newHost: room.host });
+            if (gameState.host === playerId && gameState.players.length > 0) {
+                gameState.host = gameState.players[0].id;
+                console.log(`New host assigned: ${gameState.host}`);
+                socket.to(roomId).emit('hostChanged', { newHost: gameState.host });
             }
             
             // If no players left, delete the room
-            if (room.players.length === 0) {
-                delete activeGames[roomId];
+            if (gameState.players.length === 0) {
+                await connection.execute('DELETE FROM games WHERE id = ?', [gameData.id]);
+                await connection.commit();
                 console.log(`Room ${roomId} deleted - no players remaining`);
                 return;
             }
             
+            // Update game state in database
+            await connection.execute(
+                'UPDATE games SET game_state = ? WHERE id = ?',
+                [JSON.stringify(gameState), gameData.id]
+            );
+            
+            // Commit transaction
+            await connection.commit();
+            
             // Broadcast updated room state
-            const roomState = getRoomStateForClient(room);
+            const roomState = getRoomStateForClient(gameState, roomId);
             socket.to(roomId).emit('gameUpdate', roomState);
             socket.to(roomId).emit('playerDisconnected', { 
                 playerId,
                 message: isIntentionalLeave ? `${playerId} has left the room` : `${playerId} has disconnected`
             });
             
-        } else if (room.status === 'playing' && room.gameState) {
-            // Game is in progress - mark player as inactive
-            const playerIndex = room.gameState.players.findIndex(p => p.id === playerId);
+        } else if (gameData.status === 'in_progress' && activeGames[roomId]) {
+            // Game is in progress - get from cache and mark player as inactive
+            const gameState = activeGames[roomId];
+            const playerIndex = gameState.players.findIndex(p => p.id === playerId);
             
             if (playerIndex !== -1) {
                 // Mark player as inactive
-                room.gameState.players[playerIndex].isActive = false;
+                gameState.players[playerIndex].isActive = false;
                 
                 // Clear any limbo state if disconnected player was in limbo
-                if (room.gameState.playableDrawnCard && room.gameState.playableDrawnCard.playerId === playerId) {
-                    room.gameState.playableDrawnCard = null;
+                if (gameState.playableDrawnCard && gameState.playableDrawnCard.playerId === playerId) {
+                    gameState.playableDrawnCard = null;
                 }
                 
                 // If it was the disconnected player's turn, advance to next active player
-                const wasCurrentPlayer = room.gameState.currentPlayerIndex === playerIndex;
+                const wasCurrentPlayer = gameState.currentPlayerIndex === playerIndex;
                 if (wasCurrentPlayer) {
-                    const nextPlayerIndex = getNextActivePlayerIndex(room.gameState);
-                    room.gameState.currentPlayerIndex = nextPlayerIndex;
+                    const nextPlayerIndex = getNextActivePlayerIndex(gameState);
+                    gameState.currentPlayerIndex = nextPlayerIndex;
                     
                     // Broadcast turn change to inform all players
                     socket.to(roomId).emit('turnChanged', {
                         currentPlayerIndex: nextPlayerIndex,
-                        currentPlayerId: room.gameState.players[nextPlayerIndex]?.id,
+                        currentPlayerId: gameState.players[nextPlayerIndex]?.id,
                         reason: 'Player disconnected'
                     });
                 }
                 
                 // Check if only one active player remains
-                const activePlayers = room.gameState.players.filter(p => p.isActive !== false);
+                const activePlayers = gameState.players.filter(p => p.isActive !== false);
                 if (activePlayers.length <= 1) {
                     // End the game - last active player wins
-                    room.gameState.isGameOver = true;
-                    room.gameState.winner = activePlayers.length === 1 ? activePlayers[0].id : null;
-                    room.status = 'finished';
+                    gameState.isGameOver = true;
+                    gameState.winner = activePlayers.length === 1 ? activePlayers[0].id : null;
+                    
+                    // Remove from cache and update database with completed status
+                    delete activeGames[roomId];
+                    
+                    // Get winner's user ID for database update
+                    const winnerId = gameState.winner ? await getUserId(gameState.winner) : null;
+                    
+                    await connection.execute(
+                        'UPDATE games SET status = ?, game_state = ?, winner_id = ? WHERE id = ?',
+                        ['completed', JSON.stringify(gameState), winnerId, gameData.id]
+                    );
+                    
+                    // Update player statistics asynchronously
+                    const allPlayerIds = gameState.players.map(player => player.id);
+                    updatePlayerStats(gameState.winner, allPlayerIds).catch(error => {
+                        console.error('Error updating player statistics after disconnect:', error);
+                    });
                     
                     socket.to(roomId).emit('gameOver', {
-                        winnerId: room.gameState.winner,
+                        winnerId: gameState.winner,
                         reason: isIntentionalLeave ? 'Player forfeited' : 'Other players disconnected',
-                        message: room.gameState.winner ? 
-                            `🎉 ${room.gameState.winner} wins by default!` : 
+                        message: gameState.winner ? 
+                            `🎉 ${gameState.winner} wins by default!` : 
                             'Game ended - all players have left'
+                    });
+                } else {
+                    // Update cache and asynchronously update database
+                    activeGames[roomId] = gameState;
+                    updateGameStateInDB(roomId, gameState).catch(error => {
+                        console.error('Error updating database after disconnect:', error);
                     });
                 }
                 
+                // Commit transaction
+                await connection.commit();
+                
                 // Broadcast updated game state
-                const roomState = getRoomStateForClient(room);
+                const roomState = getRoomStateForClient(gameState, roomId);
                 socket.to(roomId).emit('gameUpdate', roomState);
                 socket.to(roomId).emit('playerDisconnected', { 
                     playerId,
@@ -1087,11 +1525,22 @@ function handlePlayerDisconnect(roomId, playerId, socket, reason = 'disconnect')
                         `${playerId} has forfeited the game and will be skipped` : 
                         `${playerId} has disconnected and will be skipped`
                 });
+            } else {
+                await connection.rollback();
             }
+        } else {
+            await connection.rollback();
         }
         
     } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
         console.error('Error handling player disconnect:', error);
+    } finally {
+        if (connection) {
+            connection.release();
+        }
     }
 }
 
@@ -1121,11 +1570,11 @@ function getNextActivePlayerIndex(gameState) {
 
 /**
  * Converts room data to client-safe format with enriched player data
- * Note: Since registeredUsers is no longer available, we'll use player.id as fallback
- * @param {Object} room - Room object from activeGames
+ * @param {Object} gameState - Game state object (either lobby state or active game state)
+ * @param {string} roomId - Room ID (room_code)
  * @returns {Object} Client-safe room state with basic player info
  */
-function getRoomStateForClient(room) {
+function getRoomStateForClient(gameState, roomId) {
     /**
      * Helper function to enrich player data with basic info
      * @param {Object} player - Player object with at least an id
@@ -1136,38 +1585,30 @@ function getRoomStateForClient(room) {
             id: player.id,
             name: player.name || player.id, // Use player.name if available, fallback to id (username)
             avatar: player.avatar || 'public/assets/images/avatar/exported avatar/ava-1.svg', // Use player.avatar if available, fallback to default
-            ...(player.handSize !== undefined && { handSize: player.handSize }),
+            ...(player.hand !== undefined && { handSize: player.hand.length }),
             ...(player.isActive !== undefined && { isActive: player.isActive })
         };
     }
 
-    if (room.status === 'waiting') {
+    // Check if this is a lobby/waiting state (has status property)
+    if (gameState.status === 'waiting') {
         return {
-            roomId: room.roomId,
+            roomId: roomId,
             status: 'waiting',
-            host: room.host,
-            players: room.players.map(player => enrichPlayerData(player)), // Pass the full player object
-            playerCount: room.players.length,
-            maxPlayers: room.maxPlayers,
-            canStart: room.players.length >= 2
+            host: gameState.host,
+            players: gameState.players.map(player => enrichPlayerData(player)),
+            playerCount: gameState.players.length,
+            maxPlayers: gameState.maxPlayers,
+            canStart: gameState.players.length >= 2
         };
-    } else if (room.status === 'playing' && room.gameState) {
-        const gameState = room.gameState;
+    }
+    
+    // Check if this is an active game state (has players, currentPlayerIndex, etc.)
+    if (gameState.players && gameState.currentPlayerIndex !== undefined) {
         return {
-            roomId: room.roomId,
+            roomId: roomId,
             status: 'playing',
-            host: room.host,
-            players: gameState.players.map(player => {
-                // Find the original player data to get name and avatar
-                const originalPlayer = room.players.find(p => p.id === player.id);
-                return enrichPlayerData({
-                    id: player.id,
-                    name: originalPlayer?.name || player.id,
-                    avatar: originalPlayer?.avatar,
-                    handSize: player.hand.length,
-                    isActive: player.isActive !== false // Default to true if not set
-                });
-            }),
+            players: gameState.players.map(player => enrichPlayerData(player)),
             currentPlayerIndex: gameState.currentPlayerIndex,
             currentPlayer: gameState.players[gameState.currentPlayerIndex]?.id,
             directionOfPlay: gameState.directionOfPlay,
@@ -1178,19 +1619,69 @@ function getRoomStateForClient(room) {
             winner: gameState.winner,
             playableDrawnCard: gameState.playableDrawnCard || null
         };
-    } else {
-        return {
-            roomId: room.roomId,
-            status: room.status,
-            host: room.host,
-            players: room.players.map(player => enrichPlayerData(player)), // Pass the full player object
-            playerCount: room.players.length
-        };
+    }
+    
+    // Fallback for other states
+    return {
+        roomId: roomId,
+        status: gameState.status || 'unknown',
+        players: gameState.players ? gameState.players.map(player => enrichPlayerData(player)) : [],
+        playerCount: gameState.players ? gameState.players.length : 0
+    };
+}
+
+/**
+ * Updates player statistics in the database when a game is completed
+ * @param {string} winnerUsername - The username of the winning player
+ * @param {Array<string>} allPlayerUsernames - Array of all player usernames who participated
+ */
+async function updatePlayerStats(winnerUsername, allPlayerUsernames) {
+    let connection;
+    try {
+        connection = await dbPool.getConnection();
+        await connection.beginTransaction();
+        
+        // Update winner's stats (increment both games_won and games_played)
+        if (winnerUsername) {
+            await connection.execute(
+                'UPDATE users SET games_won = games_won + 1, games_played = games_played + 1 WHERE username = ?',
+                [winnerUsername]
+            );
+            
+            console.log(`Updated winner stats for: ${winnerUsername}`);
+        }
+        
+        // Update losers' stats (increment only games_played)
+        const loserUsernames = allPlayerUsernames.filter(username => username !== winnerUsername);
+        if (loserUsernames.length > 0) {
+            // Create placeholders for the IN clause
+            const placeholders = loserUsernames.map(() => '?').join(',');
+            await connection.execute(
+                `UPDATE users SET games_played = games_played + 1 WHERE username IN (${placeholders})`,
+                loserUsernames
+            );
+            
+            console.log(`Updated stats for ${loserUsernames.length} losing players: ${loserUsernames.join(', ')}`);
+        }
+        
+        await connection.commit();
+        console.log(`Player statistics updated successfully for game completion`);
+        
+    } catch (error) {
+        if (connection) {
+            await connection.rollback();
+        }
+        console.error('Error updating player statistics:', error);
+    } finally {
+        if (connection) {
+            connection.release();
+        }
     }
 }
 
 // Start the server, making it listen on the defined port
-httpServer.listen(PORT, () => {    console.log(`UNO Backend server is running on port ${PORT}`);
+httpServer.listen(PORT, async () => {
+    console.log(`UNO Backend server is running on port ${PORT}`);
     console.log(`Server URL: http://localhost:${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
     console.log('\nAvailable API endpoints:');
@@ -1208,5 +1699,9 @@ httpServer.listen(PORT, () => {    console.log(`UNO Backend server is running on
     console.log(`  drawCard       - Draw a card`);
     console.log(`  playDrawnCard  - Play a card that was just drawn`);
     console.log(`  passDrawnCard  - Pass on a card that was just drawn`);
-    console.log('\nUser accounts and game rooms will be stored in memory and reset on server restart.');
+    console.log('\nUser accounts and game rooms are stored persistently in MySQL database.');
+    console.log('Active games are cached in memory for optimal performance.');
+    
+    // Load active games into cache on startup
+    await loadActiveGamesIntoCache();
 });
