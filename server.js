@@ -236,6 +236,65 @@ app.post('/api/auth/login', (req, res) => {
     }
 });
 
+/**
+ * POST /api/auth/update-avatar
+ * Updates a user's avatar
+ * Body: { username: string, avatar: string }
+ * Returns: { success: boolean, user: object } or { error: string }
+ */
+app.post('/api/auth/update-avatar', (req, res) => {
+    try {
+        const { username, avatar } = req.body;
+        
+        // Validate required fields
+        if (!username || !avatar) {
+            return res.status(400).json({
+                error: 'Username and avatar are required'
+            });
+        }
+        
+        // Check if fields are not empty strings
+        if (typeof username !== 'string' || username.trim() === '' ||
+            typeof avatar !== 'string' || avatar.trim() === '') {
+            return res.status(400).json({
+                error: 'Username and avatar must be non-empty strings'
+            });
+        }
+        
+        // Find user in our "database"
+        const user = registeredUsers[username.trim()];
+        
+        if (!user) {
+            return res.status(404).json({
+                error: 'User not found'
+            });
+        }
+        
+        // Update avatar
+        user.avatar = avatar.trim();
+        
+        // Return updated user data without password
+        const userData = {
+            username: user.username,
+            name: user.name,
+            avatar: user.avatar
+        };
+        
+        console.log(`Avatar updated for user: ${username}`);
+        
+        res.status(200).json({
+            success: true,
+            user: userData
+        });
+        
+    } catch (error) {
+        console.error('Avatar update error:', error);
+        res.status(500).json({
+            error: 'Internal server error during avatar update'
+        });
+    }
+});
+
 // ============================================================================
 // ROOM MANAGEMENT ENDPOINTS
 // ============================================================================
@@ -534,6 +593,39 @@ io.on('connection', (socket) => {
         } catch (error) {
             console.error('Error in joinRoom:', error);
             socket.emit('error', { message: 'Failed to join room' });
+        }
+    });
+    
+    // Update player avatar in lobby
+    socket.on('updatePlayerAvatar', ({ roomId, playerId, avatar }) => {
+        try {
+            // Validate room exists
+            const room = activeGames[roomId];
+            if (!room) {
+                socket.emit('error', { message: 'Room not found' });
+                return;
+            }
+            
+            // Validate player is in the room
+            const playerInRoom = room.players.find(player => player.id === playerId);
+            if (!playerInRoom) {
+                socket.emit('error', { message: 'Player not in this room' });
+                return;
+            }
+            
+            // Update the player's avatar in the room state
+            // Note: The avatar is stored in the user database, but we need to update 
+            // the room state to reflect the new avatar for lobby display
+            
+            console.log(`Player ${playerId} updated avatar in room ${roomId}`);
+            
+            // Send updated room state to all players in the room
+            const roomState = getRoomStateForClient(room);
+            io.to(roomId).emit('gameUpdate', roomState);
+            
+        } catch (error) {
+            console.error('Error in updatePlayerAvatar:', error);
+            socket.emit('error', { message: 'Failed to update avatar' });
         }
     });
       // Start the game (only host can do this)
