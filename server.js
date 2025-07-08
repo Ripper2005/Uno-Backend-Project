@@ -17,6 +17,8 @@ const express = require('express');
 const { createServer } = require('http');
 const cors = require('cors'); // <-- Import
 const { Server } = require('socket.io');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcrypt');
 
 // Import the Game Engine - handles all UNO game logic
 const GameEngine = require('./game-logic/GameEngine');
@@ -33,6 +35,17 @@ const io = new Server(httpServer, {
     }
 });
 
+// Create MySQL connection pool
+const dbPool = mysql.createPool({
+  host: 'localhost',
+  user: 'root',
+  password: 'root', // IMPORTANT: Replace this with your actual MySQL password
+  database: 'uno',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
 /**
  * In-memory storage for active games
  * Structure: {
@@ -47,20 +60,6 @@ const io = new Server(httpServer, {
  * }
  */
 let activeGames = {};
-
-/**
- * In-memory storage for registered users
- * Structure: {
- *   username: {
- *     username: string,
- *     name: string,
- *     password: string,
- *     avatar: string,
- *     registeredAt: Date
- *   }
- * }
- */
-let registeredUsers = {};
 
 // Server configuration
 const PORT = 3001;
@@ -114,49 +113,47 @@ app.get('/api/status', (req, res) => {
 /**
  * POST /api/auth/register
  * Registers a new user account
- * Body: { name: string, username: string, password: string, avatar: string }
+ * Body: { full_name: string, username: string, password: string, avatar_url: string }
  * Returns: { success: boolean, message: string }
  */
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
     try {
-        const { name, username, password, avatar } = req.body;
+        const { full_name, username, password, avatar_url } = req.body;
         
         // Validate required fields
-        if (!name || !username || !password || !avatar) {
+        if (!full_name || !username || !password || !avatar_url) {
             return res.status(400).json({
-                error: 'All fields are required: name, username, password, avatar'
+                error: 'All fields are required: full_name, username, password, avatar_url'
             });
         }
         
         // Check if fields are not empty strings
-        if (typeof name !== 'string' || name.trim() === '' ||
+        if (typeof full_name !== 'string' || full_name.trim() === '' ||
             typeof username !== 'string' || username.trim() === '' ||
             typeof password !== 'string' || password.trim() === '' ||
-            typeof avatar !== 'string' || avatar.trim() === '') {
+            typeof avatar_url !== 'string' || avatar_url.trim() === '') {
             return res.status(400).json({
                 error: 'All fields must be non-empty strings'
             });
         }
+
+        // Hash the password
+        const saltRounds = 10;
+        const password_hash = await bcrypt.hash(password, saltRounds);
+
+        // Insert new user into database
+        const insertQuery = `
+            INSERT INTO users (username, password_hash, full_name, avatar_url, games_played, games_won, registered_at)
+            VALUES (?, ?, ?, ?, 0, 0, NOW())
+        `;
         
-        // Check if username already exists
-        if (registeredUsers[username.trim()]) {
-            return res.status(400).json({
-                error: 'Username already exists'
-            });
-        }
-        
-        // Create new user (simulate password hashing with simple suffix)
-        const newUser = {
-            username: username.trim(),
-            name: name.trim(),
-            password: password + '_secret', // Simple password "hashing" simulation
-            avatar: avatar.trim(),
-            registeredAt: new Date()
-        };
-        
-        // Store user in our "database"
-        registeredUsers[username.trim()] = newUser;
-        
+        await dbPool.execute(insertQuery, [
+            username.trim(),
+            password_hash,
+            full_name.trim(),
+            avatar_url.trim()
+        ]);
+
         console.log(`New user registered: ${username}`);
         
         res.status(201).json({
@@ -166,6 +163,14 @@ app.post('/api/auth/register', (req, res) => {
         
     } catch (error) {
         console.error('Registration error:', error);
+        
+        // Handle duplicate username error
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(400).json({
+                error: 'Username already exists'
+            });
+        }
+        
         res.status(500).json({
             error: 'Internal server error during registration'
         });
@@ -178,7 +183,7 @@ app.post('/api/auth/register', (req, res) => {
  * Body: { username: string, password: string }
  * Returns: { success: boolean, user: object } or { error: string }
  */
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     try {
         const { username, password } = req.body;
         
@@ -197,18 +202,27 @@ app.post('/api/auth/login', (req, res) => {
             });
         }
         
-        // Find user in our "database"
-        const user = registeredUsers[username.trim()];
+        // Find user in database
+        const selectQuery = `
+            SELECT id, username, password_hash, full_name, avatar_url, games_played, games_won, registered_at
+            FROM users
+            WHERE username = ?
+        `;
         
-        if (!user) {
+        const [rows] = await dbPool.execute(selectQuery, [username.trim()]);
+        
+        if (rows.length === 0) {
             return res.status(401).json({
                 error: 'Invalid username or password'
             });
         }
         
-        // Verify password (simulate password verification)
-        const expectedPassword = password + '_secret';
-        if (user.password !== expectedPassword) {
+        const user = rows[0];
+        
+        // Verify password
+        const passwordMatch = await bcrypt.compare(password, user.password_hash);
+        
+        if (!passwordMatch) {
             return res.status(401).json({
                 error: 'Invalid username or password'
             });
@@ -216,9 +230,13 @@ app.post('/api/auth/login', (req, res) => {
         
         // Login successful - return user data without password
         const userData = {
+            id: user.id,
             username: user.username,
-            name: user.name,
-            avatar: user.avatar
+            name: user.full_name,
+            avatar: user.avatar_url,
+            games_played: user.games_played,
+            games_won: user.games_won,
+            registered_at: user.registered_at
         };
         
         console.log(`User logged in: ${username}`);
@@ -242,7 +260,7 @@ app.post('/api/auth/login', (req, res) => {
  * Body: { username: string, avatar: string }
  * Returns: { success: boolean, user: object } or { error: string }
  */
-app.post('/api/auth/update-avatar', (req, res) => {
+app.post('/api/auth/update-avatar', async (req, res) => {
     try {
         const { username, avatar } = req.body;
         
@@ -261,23 +279,40 @@ app.post('/api/auth/update-avatar', (req, res) => {
             });
         }
         
-        // Find user in our "database"
-        const user = registeredUsers[username.trim()];
+        // Update avatar in database
+        const updateQuery = `
+            UPDATE users 
+            SET avatar_url = ?
+            WHERE username = ?
+        `;
         
-        if (!user) {
+        const [result] = await dbPool.execute(updateQuery, [avatar.trim(), username.trim()]);
+        
+        if (result.affectedRows === 0) {
             return res.status(404).json({
                 error: 'User not found'
             });
         }
         
-        // Update avatar
-        user.avatar = avatar.trim();
+        // Get updated user data
+        const selectQuery = `
+            SELECT id, username, full_name, avatar_url, games_played, games_won, registered_at
+            FROM users
+            WHERE username = ?
+        `;
         
-        // Return updated user data without password
+        const [rows] = await dbPool.execute(selectQuery, [username.trim()]);
+        const user = rows[0];
+        
+        // Return updated user data
         const userData = {
+            id: user.id,
             username: user.username,
-            name: user.name,
-            avatar: user.avatar
+            name: user.full_name,
+            avatar: user.avatar_url,
+            games_played: user.games_played,
+            games_won: user.games_won,
+            registered_at: user.registered_at
         };
         
         console.log(`Avatar updated for user: ${username}`);
@@ -305,7 +340,7 @@ app.post('/api/auth/update-avatar', (req, res) => {
  * Body: { playerId: string }
  * Returns: { roomId: string }
  */
-app.post('/api/rooms/create', (req, res) => {
+app.post('/api/rooms/create', async (req, res) => {
     try {
         const { playerId, maxPlayers } = req.body;
         
@@ -324,6 +359,20 @@ app.post('/api/rooms/create', (req, res) => {
             });
         }
         
+        // Fetch player profile data from database
+        const [userRows] = await dbPool.execute(
+            'SELECT username, full_name, avatar_url FROM users WHERE username = ?',
+            [playerId.trim()]
+        );
+        
+        if (userRows.length === 0) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+        
+        const playerData = userRows[0];
+        
         // Generate unique room ID
         const roomId = generateRoomId();
         
@@ -331,7 +380,12 @@ app.post('/api/rooms/create', (req, res) => {
         const roomState = {
             roomId: roomId,
             host: playerId.trim(),
-            players: [{ id: playerId.trim(), hand: [] }],
+            players: [{ 
+                id: playerId.trim(), 
+                name: playerData.full_name,
+                avatar: playerData.avatar_url,
+                hand: [] 
+            }],
             status: 'waiting', // 'waiting', 'playing', 'finished'
             gameState: null, // Will be created when game starts
             maxPlayers: playerLimit, // Use the requested player limit
@@ -362,7 +416,7 @@ app.post('/api/rooms/create', (req, res) => {
  * Body: { playerId: string }
  * Returns: { success: boolean, message: string, gameStarted: boolean }
  */
-app.post('/api/rooms/:roomId/join', (req, res) => {
+app.post('/api/rooms/:roomId/join', async (req, res) => {
     try {
         const { roomId } = req.params;
         const { playerId } = req.body;
@@ -403,9 +457,26 @@ app.post('/api/rooms/:roomId/join', (req, res) => {
                 error: `Room is full (maximum ${room.maxPlayers} players)`
             });
         }
-          // Add player to the room
+        
+        // Fetch player profile data from database
+        const [userRows] = await dbPool.execute(
+            'SELECT username, full_name, avatar_url FROM users WHERE username = ?',
+            [playerId.trim()]
+        );
+        
+        if (userRows.length === 0) {
+            return res.status(404).json({
+                error: 'Player not found'
+            });
+        }
+        
+        const playerData = userRows[0];
+        
+        // Add player to the room
         room.players.push({
             id: playerId.trim(),
+            name: playerData.full_name,
+            avatar: playerData.avatar_url,
             hand: []
         });
         
@@ -416,7 +487,8 @@ app.post('/api/rooms/:roomId/join', (req, res) => {
         // Auto-start removed to allow manual game initiation
         
         console.log(`Player ${playerId} joined room: ${roomId} (${room.players.length} players total)`);
-          res.json({
+        
+        res.json({
             success: true,
             message: 'Player joined successfully',
             gameStarted: false,
@@ -614,8 +686,7 @@ io.on('connection', (socket) => {
             }
             
             // Update the player's avatar in the room state
-            // Note: The avatar is stored in the user database, but we need to update 
-            // the room state to reflect the new avatar for lobby display
+            playerInRoom.avatar = avatar;
             
             console.log(`Player ${playerId} updated avatar in room ${roomId}`);
             
@@ -1050,22 +1121,21 @@ function getNextActivePlayerIndex(gameState) {
 
 /**
  * Converts room data to client-safe format with enriched player data
- * Looks up player display information from registeredUsers database
+ * Note: Since registeredUsers is no longer available, we'll use player.id as fallback
  * @param {Object} room - Room object from activeGames
- * @returns {Object} Client-safe room state with full player info
+ * @returns {Object} Client-safe room state with basic player info
  */
 function getRoomStateForClient(room) {
     /**
-     * Helper function to enrich player data with name and avatar
+     * Helper function to enrich player data with basic info
      * @param {Object} player - Player object with at least an id
-     * @returns {Object} Enriched player object with { id, name, avatar, handSize?, isActive? }
+     * @returns {Object} Basic player object with { id, name, avatar, handSize?, isActive? }
      */
     function enrichPlayerData(player) {
-        const userData = registeredUsers[player.id];
         return {
             id: player.id,
-            name: userData ? userData.name : player.id, // Fallback to id if user not found
-            avatar: userData ? userData.avatar : 'public/assets/images/avatar/a1.jpg', // Default avatar
+            name: player.name || player.id, // Use player.name if available, fallback to id (username)
+            avatar: player.avatar || 'public/assets/images/avatar/exported avatar/ava-1.svg', // Use player.avatar if available, fallback to default
             ...(player.handSize !== undefined && { handSize: player.handSize }),
             ...(player.isActive !== undefined && { isActive: player.isActive })
         };
@@ -1076,7 +1146,7 @@ function getRoomStateForClient(room) {
             roomId: room.roomId,
             status: 'waiting',
             host: room.host,
-            players: room.players.map(player => enrichPlayerData({ id: player.id })),
+            players: room.players.map(player => enrichPlayerData(player)), // Pass the full player object
             playerCount: room.players.length,
             maxPlayers: room.maxPlayers,
             canStart: room.players.length >= 2
@@ -1087,11 +1157,17 @@ function getRoomStateForClient(room) {
             roomId: room.roomId,
             status: 'playing',
             host: room.host,
-            players: gameState.players.map(player => enrichPlayerData({
-                id: player.id,
-                handSize: player.hand.length,
-                isActive: player.isActive !== false // Default to true if not set
-            })),
+            players: gameState.players.map(player => {
+                // Find the original player data to get name and avatar
+                const originalPlayer = room.players.find(p => p.id === player.id);
+                return enrichPlayerData({
+                    id: player.id,
+                    name: originalPlayer?.name || player.id,
+                    avatar: originalPlayer?.avatar,
+                    handSize: player.hand.length,
+                    isActive: player.isActive !== false // Default to true if not set
+                });
+            }),
             currentPlayerIndex: gameState.currentPlayerIndex,
             currentPlayer: gameState.players[gameState.currentPlayerIndex]?.id,
             directionOfPlay: gameState.directionOfPlay,
@@ -1107,7 +1183,7 @@ function getRoomStateForClient(room) {
             roomId: room.roomId,
             status: room.status,
             host: room.host,
-            players: room.players.map(player => enrichPlayerData({ id: player.id })),
+            players: room.players.map(player => enrichPlayerData(player)), // Pass the full player object
             playerCount: room.players.length
         };
     }
