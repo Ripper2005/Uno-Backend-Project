@@ -140,6 +140,15 @@ function isMoveValid(cardToPlay, topCard, currentColor) {
 
 
 /**
+ * Counts the number of active players in the game
+ * @param {Object} gameState - Current game state
+ * @returns {number} Number of active players
+ */
+function countActivePlayers(gameState) {
+    return gameState.players.filter(player => player.isActive !== false).length;
+}
+
+/**
  * Applies the effect of a played card to the game state
  * @param {Object} gameState - Current game state (with deep copies already made)
  * @param {Object} card - The card that was played
@@ -157,11 +166,12 @@ function applyCardEffect(gameState, card, chosenColor = null) {
         case 'reverse':
             // Reverse direction
             gameState.directionOfPlay *= -1;
-            if (gameState.players.length === 2) {
-                // In 2-player game, reverse acts like skip
+            const activePlayerCount = countActivePlayers(gameState);
+            if (activePlayerCount === 2) {
+                // In 2-active-player game, reverse acts like skip
                 gameState.currentPlayerIndex = getNextPlayerIndex(gameState, 2);
             } else {
-                // In games with 3+ players, just reverse direction, normal turn advance
+                // In games with 3+ active players, just reverse direction, normal turn advance
                 gameState.currentPlayerIndex = getNextPlayerIndex(gameState, 1);
             }
             break;
@@ -193,7 +203,8 @@ function applyCardEffect(gameState, card, chosenColor = null) {
         case 'wild':
             // Set the chosen color
             gameState.currentColor = chosenColor;
-            // Regular turn advance (handled in playCard function)
+            // Advance turn for wild cards
+            gameState.currentPlayerIndex = getNextPlayerIndex(gameState, 1);
             break;
             
         case 'wild_draw4':
@@ -225,7 +236,7 @@ function applyCardEffect(gameState, card, chosenColor = null) {
         default:
             // Regular number card, just update color
             gameState.currentColor = card.color;
-            // Regular turn advance (handled in playCard function)
+            // Turn advancement for number cards is handled by the calling function
             break;
     }
     
@@ -233,23 +244,41 @@ function applyCardEffect(gameState, card, chosenColor = null) {
 }
 
 /**
- * Gets the index of the next player based on direction of play
+ * Gets the index of the next player based on direction of play, skipping inactive players
  * @param {Object} gameState - Current game state
  * @param {number} steps - Number of steps to advance (default 1)
- * @returns {number} Index of next player
+ * @returns {number} Index of next active player
  */
 function getNextPlayerIndex(gameState, steps = 1) {
     const { currentPlayerIndex, directionOfPlay, players } = gameState;
     const totalPlayers = players.length;
     
-    let nextIndex = currentPlayerIndex + (steps * directionOfPlay);
+    let nextIndex = currentPlayerIndex;
+    let stepsRemaining = steps;
+    let attempts = 0;
     
-    // Handle wraparound
-    while (nextIndex < 0) {
-        nextIndex += totalPlayers;
+    // Advance the specified number of steps, skipping inactive players
+    while (stepsRemaining > 0 && attempts < totalPlayers * 2) {
+        nextIndex = nextIndex + directionOfPlay;
+        
+        // Handle wraparound
+        if (nextIndex < 0) {
+            nextIndex = totalPlayers - 1;
+        } else if (nextIndex >= totalPlayers) {
+            nextIndex = 0;
+        }
+        
+        // Only count this step if the player is active (or if isActive is not set - backwards compatibility)
+        if (players[nextIndex].isActive !== false) {
+            stepsRemaining--;
+        }
+        
+        attempts++;
     }
-    while (nextIndex >= totalPlayers) {
-        nextIndex -= totalPlayers;
+    
+    // Fallback: if all players are inactive, return current index
+    if (attempts >= totalPlayers * 2) {
+        return currentPlayerIndex;
     }
     
     return nextIndex;
@@ -428,19 +457,22 @@ function playCard(gameState, playerId, cardToPlay, chosenColor = null) {
     // Add card to discard pile
     newState.discardPile.push(cardToPlay);
     
-    // Apply card effect first (this handles turn advancement based on card type)
-    const stateAfterEffect = applyCardEffect(newState, cardToPlay, chosenColor);
-    
-    // Check for winner after applying effects (check the player who just played)
-    if (checkWinner(newState.players[newState.currentPlayerIndex])) {
-        stateAfterEffect.isGameOver = true;
-        stateAfterEffect.winner = playerId;
+    // Check for winner BEFORE applying card effects (check the player who just played)
+    const playerWhoJustPlayed = newState.players[newState.currentPlayerIndex];
+    if (checkWinner(playerWhoJustPlayed)) {
+        newState.isGameOver = true;
+        newState.winner = playerId;
+        // Still apply card effects for consistency, but game is over
+        const stateAfterEffect = applyCardEffect(newState, cardToPlay, chosenColor);
+        return stateAfterEffect;
     }
     
-    // Only advance turn for cards that don't handle their own turn logic
-    // Action cards (skip, reverse, draw2, wild_draw4) handle turn advancement internally
-    if (cardToPlay.type === 'number' || 
-        (cardToPlay.type === 'wild' && cardToPlay.value === 'wild')) {
+    // Apply card effect (this handles turn advancement based on card type)
+    const stateAfterEffect = applyCardEffect(newState, cardToPlay, chosenColor);
+    
+    // Only advance turn for number cards
+    // Action cards and wild cards handle turn advancement internally in applyCardEffect
+    if (cardToPlay.type === 'number') {
         stateAfterEffect.currentPlayerIndex = getNextPlayerIndex(stateAfterEffect, 1);
     }
     
@@ -569,19 +601,22 @@ function playDrawnCard(gameState, playerId, chosenColor = null) {
     // Clear the playableDrawnCard (exit limbo state)
     newState.playableDrawnCard = null;
     
+    // Check for winner BEFORE applying card effects (check the player who just played)
+    const playerWhoJustPlayed = newState.players[newState.currentPlayerIndex];
+    if (checkWinner(playerWhoJustPlayed)) {
+        newState.isGameOver = true;
+        newState.winner = playerId;
+        // Still apply card effects for consistency, but game is over
+        const stateAfterEffect = applyCardEffect(newState, cardToPlay, chosenColor);
+        return stateAfterEffect;
+    }
+    
     // Apply card effect (this handles turn advancement based on card type)
     const stateAfterEffect = applyCardEffect(newState, cardToPlay, chosenColor);
     
-    // Check for winner after applying effects (check the player who just played)
-    if (checkWinner(newState.players[newState.currentPlayerIndex])) {
-        stateAfterEffect.isGameOver = true;
-        stateAfterEffect.winner = playerId;
-    }
-    
-    // Only advance turn for cards that don't handle their own turn logic
-    // Action cards (skip, reverse, draw2, wild_draw4) handle turn advancement internally
-    if (cardToPlay.type === 'number' || 
-        (cardToPlay.type === 'wild' && cardToPlay.value === 'wild')) {
+    // Only advance turn for number cards
+    // Action cards and wild cards handle turn advancement internally in applyCardEffect
+    if (cardToPlay.type === 'number') {
         stateAfterEffect.currentPlayerIndex = getNextPlayerIndex(stateAfterEffect, 1);
     }
     

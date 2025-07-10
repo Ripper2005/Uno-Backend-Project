@@ -563,26 +563,54 @@ app.post('/api/rooms/:roomId/join', async (req, res) => {
         const userData = userRows[0];
         const joiningUserId = userData.id;
         
-        // Check if player is already in the game
+        // Check if player is already in the game (check both database and game state)
         const [participantRows] = await connection.execute(
             'SELECT user_id FROM game_participants WHERE game_id = ? AND user_id = ?',
             [gameData.id, joiningUserId]
         );
         
-        if (participantRows.length > 0) {
+        const isInDatabase = participantRows.length > 0;
+        const isInGameState = gameState.players.some(player => player.id === playerId.trim());
+        
+        // If player is in game state but not in database, clean up the game state
+        if (isInGameState && !isInDatabase) {
+            console.log(`Cleaning up orphaned player ${playerId} from game state`);
+            gameState.players = gameState.players.filter(player => player.id !== playerId.trim());
+            await connection.execute(
+                'UPDATE games SET game_state = ? WHERE id = ?',
+                [JSON.stringify(gameState), gameData.id]
+            );
+        }
+        
+        // If player is in database but not in game state, clean up the database
+        if (!isInGameState && isInDatabase) {
+            console.log(`Cleaning up orphaned player ${playerId} from database`);
+            await connection.execute(
+                'DELETE FROM game_participants WHERE game_id = ? AND user_id = ?',
+                [gameData.id, joiningUserId]
+            );
+        }
+        
+        // If player is in both, they're actually already in the room
+        if (isInDatabase && isInGameState) {
             await connection.rollback();
             return res.status(400).json({
                 error: 'Player already in this room'
             });
         }
         
-        // Check room capacity
+        // Check room capacity (use both database count and game state length for accuracy)
         const [participantCountRows] = await connection.execute(
             'SELECT COUNT(*) as count FROM game_participants WHERE game_id = ?',
             [gameData.id]
         );
         
-        const currentPlayerCount = participantCountRows[0].count;
+        const databasePlayerCount = participantCountRows[0].count;
+        const gameStatePlayerCount = gameState.players.length;
+        
+        // Use the maximum of both counts to be safe
+        const currentPlayerCount = Math.max(databasePlayerCount, gameStatePlayerCount);
+        
         if (currentPlayerCount >= gameState.maxPlayers) {
             await connection.rollback();
             return res.status(400).json({
@@ -1298,13 +1326,18 @@ io.on('connection', (socket) => {
                 return;
             }
             
-            // Use the same disconnect handling logic
-            handlePlayerDisconnect(roomId, playerId, socket, 'intentional_leave');
-            
-            // Remove socket from room
+            // Remove socket from room first
             socket.leave(roomId);
+            console.log(`Socket ${socket.id} left room ${roomId} (intentional leave)`);
+            
+            // Clear socket room/player tracking
+            const oldRoomId = socket.roomId;
+            const oldPlayerId = socket.playerId;
             socket.roomId = null;
             socket.playerId = null;
+            
+            // Use the same disconnect handling logic
+            handlePlayerDisconnect(oldRoomId, oldPlayerId, socket, 'intentional_leave');
             
         } catch (error) {
             console.error('Error handling leave room:', error);
@@ -1312,11 +1345,16 @@ io.on('connection', (socket) => {
         }
     });
     
-      // Handle player disconnect
+    // Handle player disconnect
     socket.on('disconnect', () => {
-        console.log(`Socket disconnected: ${socket.id}`);
+        console.log(`Socket disconnected: ${socket.id}, Player: ${socket.playerId}, Room: ${socket.roomId}`);
         
         if (socket.roomId && socket.playerId) {
+            // Leave the socket room before processing disconnect
+            socket.leave(socket.roomId);
+            console.log(`Socket ${socket.id} left room ${socket.roomId}`);
+            
+            // Process the disconnect
             handlePlayerDisconnect(socket.roomId, socket.playerId, socket);
         }
     });
@@ -1398,34 +1436,92 @@ async function handlePlayerDisconnect(roomId, playerId, socket, reason = 'discon
         console.log(`Player ${playerId} ${isIntentionalLeave ? 'left' : 'disconnected from'} room ${roomId}`);
         
         if (gameData.status === 'waiting') {
-            // Game hasn't started - remove player from room
-            gameState.players = gameState.players.filter(player => player.id !== playerId);
+            // Game hasn't started - remove player from waiting room
+            console.log(`Processing disconnect from waiting room. Current players: ${gameState.players.map(p => p.id).join(', ')}`);
             
-            // Remove from game_participants table
+            // Check if player is actually in the room
+            const playerExists = gameState.players.find(player => player.id === playerId);
+            if (!playerExists) {
+                // Player not in game state, but let's still check database and clean up if needed
+                const [userRows] = await connection.execute(
+                    'SELECT id FROM users WHERE username = ?',
+                    [playerId]
+                );
+                
+                if (userRows.length > 0) {
+                    const userId = userRows[0].id;
+                    const [deleteResult] = await connection.execute(
+                        'DELETE FROM game_participants WHERE game_id = ? AND user_id = ?',
+                        [gameData.id, userId]
+                    );
+                    
+                    if (deleteResult.affectedRows > 0) {
+                        console.log(`Cleaned up orphaned database entry for player ${playerId} during disconnect`);
+                        await connection.commit();
+                    } else {
+                        await connection.rollback();
+                    }
+                } else {
+                    await connection.rollback();
+                }
+                
+                console.log(`Player ${playerId} not found in room ${roomId} during disconnect`);
+                return;
+            }
+            
+            // Remove player from game state
+            const originalPlayerCount = gameState.players.length;
+            gameState.players = gameState.players.filter(player => player.id !== playerId);
+            const newPlayerCount = gameState.players.length;
+            
+            // Verify player was actually removed
+            if (originalPlayerCount === newPlayerCount) {
+                await connection.rollback();
+                console.error(`Failed to remove player ${playerId} from room ${roomId} game state`);
+                return;
+            }
+            
+            console.log(`Removed player ${playerId} from room ${roomId}. Players remaining: ${gameState.players.map(p => p.id).join(', ')}`);
+            
+            // Remove from game_participants table in database
             const [userRows] = await connection.execute(
                 'SELECT id FROM users WHERE username = ?',
                 [playerId]
             );
             
-            if (userRows.length > 0) {
-                await connection.execute(
-                    'DELETE FROM game_participants WHERE game_id = ? AND user_id = ?',
-                    [gameData.id, userRows[0].id]
-                );
+            if (userRows.length === 0) {
+                console.error(`User ${playerId} not found in database during disconnect`);
+                await connection.rollback();
+                return;
             }
             
-            // If host disconnected, make first remaining player the host
+            const userId = userRows[0].id;
+            const [deleteResult] = await connection.execute(
+                'DELETE FROM game_participants WHERE game_id = ? AND user_id = ?',
+                [gameData.id, userId]
+            );
+            
+            if (deleteResult.affectedRows === 0) {
+                console.warn(`Player ${playerId} was not in game_participants table for game ${gameData.id}`);
+            } else {
+                console.log(`Removed player ${playerId} (user_id: ${userId}) from game_participants table`);
+            }
+            
+            // Handle host reassignment if needed
+            let newHost = null;
             if (gameState.host === playerId && gameState.players.length > 0) {
-                gameState.host = gameState.players[0].id;
-                console.log(`New host assigned: ${gameState.host}`);
-                socket.to(roomId).emit('hostChanged', { newHost: gameState.host });
+                newHost = gameState.players[0].id;
+                gameState.host = newHost;
+                console.log(`Host ${playerId} disconnected. New host assigned: ${newHost}`);
             }
             
-            // If no players left, delete the room
+            // If no players left, delete the entire room
             if (gameState.players.length === 0) {
+                // Delete all related data
+                await connection.execute('DELETE FROM game_participants WHERE game_id = ?', [gameData.id]);
                 await connection.execute('DELETE FROM games WHERE id = ?', [gameData.id]);
                 await connection.commit();
-                console.log(`Room ${roomId} deleted - no players remaining`);
+                console.log(`Room ${roomId} completely deleted - no players remaining`);
                 return;
             }
             
@@ -1435,16 +1531,34 @@ async function handlePlayerDisconnect(roomId, playerId, socket, reason = 'discon
                 [JSON.stringify(gameState), gameData.id]
             );
             
-            // Commit transaction
+            // Commit all database changes
             await connection.commit();
+            console.log(`Database updated for room ${roomId} after player ${playerId} disconnect`);
             
-            // Broadcast updated room state
+            // Broadcast updated room state to ALL players in the room (including the disconnecting player)
             const roomState = getRoomStateForClient(gameState, roomId);
-            socket.to(roomId).emit('gameUpdate', roomState);
-            socket.to(roomId).emit('playerDisconnected', { 
+            io.to(roomId).emit('gameUpdate', roomState);
+            
+            // Broadcast player disconnection message
+            const disconnectMessage = isIntentionalLeave ? 
+                `${playerId} has left the room` : 
+                `${playerId} has disconnected`;
+            
+            io.to(roomId).emit('playerDisconnected', { 
                 playerId,
-                message: isIntentionalLeave ? `${playerId} has left the room` : `${playerId} has disconnected`
+                message: disconnectMessage,
+                remainingPlayers: gameState.players.length
             });
+            
+            // If host changed, notify all players
+            if (newHost) {
+                io.to(roomId).emit('hostChanged', { 
+                    newHost: newHost,
+                    message: `${newHost} is now the host`
+                });
+            }
+            
+            console.log(`Successfully processed disconnect for player ${playerId} from waiting room ${roomId}`);
             
         } else if (gameData.status === 'in_progress' && activeGames[roomId]) {
             // Game is in progress - get from cache and mark player as inactive
