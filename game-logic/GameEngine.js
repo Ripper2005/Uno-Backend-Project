@@ -160,11 +160,13 @@ function applyCardEffect(gameState, card, chosenColor = null) {
     switch (card.value) {
         case 'skip':
             // Skip next player (advance turn by 2 to skip the next player)
+            gameState.currentColor = card.color; // FIX: Set color for skip cards
             gameState.currentPlayerIndex = getNextPlayerIndex(gameState, 2);
             break;
             
         case 'reverse':
             // Reverse direction
+            gameState.currentColor = card.color; // FIX: Set color for reverse cards
             gameState.directionOfPlay *= -1;
             const activePlayerCount = countActivePlayers(gameState);
             if (activePlayerCount === 2) {
@@ -178,6 +180,7 @@ function applyCardEffect(gameState, card, chosenColor = null) {
             
         case 'draw2':
             // Next player draws 2 cards and loses turn
+            gameState.currentColor = card.color; // FIX: Set color for draw2 cards
             const nextPlayerIndex = getNextPlayerIndex(gameState, 1);
             
             // Ensure we have enough cards, reshuffle if needed
@@ -457,6 +460,16 @@ function playCard(gameState, playerId, cardToPlay, chosenColor = null) {
     // Add card to discard pile
     newState.discardPile.push(cardToPlay);
     
+    // UNO State Detection: Check if player now has exactly one card
+    const playerWhoPlayed = newState.players.find(p => p.id === playerId);
+    if (playerWhoPlayed && playerWhoPlayed.hand.length === 1) {
+        // This player is now on UNO!
+        newState.unoPlayerId = playerId;
+    } else if (newState.unoPlayerId === playerId) {
+        // This player was on UNO but now has 0 cards (won) or > 1 cards (safe)
+        newState.unoPlayerId = null;
+    }
+    
     // Check for winner BEFORE applying card effects (check the player who just played)
     const playerWhoJustPlayed = newState.players[newState.currentPlayerIndex];
     if (checkWinner(playerWhoJustPlayed)) {
@@ -537,6 +550,12 @@ function drawCard(gameState, playerId) {
     } else {
         // Card is not playable - add to hand and end turn
         newState.players[newState.currentPlayerIndex].hand.push(drawnCard);
+        
+        // Clear UNO flag if this player was on UNO and just drew a card
+        if (newState.unoPlayerId === playerId) {
+            newState.unoPlayerId = null;
+        }
+        
         newState.currentPlayerIndex = getNextPlayerIndex(newState, 1);
         newState.playableDrawnCard = null;
         return newState;
@@ -601,6 +620,18 @@ function playDrawnCard(gameState, playerId, chosenColor = null) {
     // Clear the playableDrawnCard (exit limbo state)
     newState.playableDrawnCard = null;
     
+    // UNO State Detection: Check if player now has exactly one card
+    // Note: When playing a drawn card, the player's hand size doesn't change
+    // but we need to check if they would have 1 card after this action
+    const playerWhoPlayed = newState.players.find(p => p.id === playerId);
+    if (playerWhoPlayed && playerWhoPlayed.hand.length === 1) {
+        // This player is now on UNO!
+        newState.unoPlayerId = playerId;
+    } else if (newState.unoPlayerId === playerId) {
+        // This player was on UNO but now has 0 cards (won) or > 1 cards (safe)
+        newState.unoPlayerId = null;
+    }
+    
     // Check for winner BEFORE applying card effects (check the player who just played)
     const playerWhoJustPlayed = newState.players[newState.currentPlayerIndex];
     if (checkWinner(playerWhoJustPlayed)) {
@@ -661,11 +692,133 @@ function passDrawnCard(gameState, playerId) {
     const drawnCard = gameState.playableDrawnCard.card;
     newState.players[newState.currentPlayerIndex].hand.push(drawnCard);
     
+    // Clear UNO flag if this player was on UNO and just added a card to their hand
+    if (newState.unoPlayerId === playerId) {
+        newState.unoPlayerId = null;
+    }
+    
     // Clear the playableDrawnCard (exit limbo state)
     newState.playableDrawnCard = null;
     
     // End the current player's turn by advancing to the next player
     newState.currentPlayerIndex = getNextPlayerIndex(newState, 1);
+    
+    return newState;
+}
+
+/**
+ * Applies a penalty to a player who was caught not calling UNO
+ * Includes race condition protection - only valid if player is still vulnerable
+ * @param {Object} gameState - Current game state
+ * @param {string} targetPlayerId - ID of the player to penalize
+ * @param {string} callerPlayerId - ID of the player calling UNO (for logging/validation)
+ * @returns {Object} Updated game state with penalty applied, or error if invalid
+ */
+function callUnoPenalty(gameState, targetPlayerId, callerPlayerId = null) {
+    // Validation: Check if the call is valid
+    if (gameState.unoPlayerId !== targetPlayerId) {
+        // Player is already safe or someone else was called out
+        return { 
+            error: 'UNO call invalid - player is no longer vulnerable',
+            success: false 
+        };
+    }
+    
+    // Find the target player
+    const targetPlayer = gameState.players.find(player => player.id === targetPlayerId);
+    if (!targetPlayer) {
+        return { 
+            error: 'Player not found',
+            success: false 
+        };
+    }
+    
+    // Double-check player actually has 1 card (race condition protection)
+    if (targetPlayer.hand.length !== 1) {
+        return { 
+            error: 'UNO call invalid - player does not have exactly 1 card',
+            success: false 
+        };
+    }
+    
+    // Create a new state object to avoid mutating the original
+    const newState = {
+        ...gameState,
+        players: gameState.players.map(player => ({
+            ...player,
+            hand: [...player.hand]
+        })),
+        drawPile: [...gameState.drawPile],
+        discardPile: [...gameState.discardPile]
+    };
+    
+    // Find the target player in the new state
+    const newTargetPlayer = newState.players.find(player => player.id === targetPlayerId);
+    
+    // Apply penalty: Add two cards to the target player's hand
+    for (let i = 0; i < 2; i++) {
+        // Check if we need to reshuffle the deck
+        if (newState.drawPile.length === 0) {
+            const reshuffledState = reshuffleDiscardPile(newState);
+            newState.drawPile = [...reshuffledState.drawPile];
+            newState.discardPile = [...reshuffledState.discardPile];
+        }
+        
+        // Draw a card from the draw pile
+        if (newState.drawPile.length > 0) {
+            const penaltyCard = newState.drawPile.pop();
+            newTargetPlayer.hand.push(penaltyCard);
+        }
+    }
+    
+    // Clear the UNO flag since the player is no longer vulnerable
+    newState.unoPlayerId = null;
+    
+    // Return success with metadata
+    return {
+        ...newState,
+        success: true,
+        penaltyApplied: {
+            targetPlayer: targetPlayerId,
+            callerPlayer: callerPlayerId,
+            cardsAdded: 2
+        }
+    };
+}
+
+/**
+ * Allows a player to call UNO on themselves to avoid penalty
+ * @param {Object} gameState - Current game state
+ * @param {string} playerId - ID of the player calling UNO on themselves
+ * @returns {Object} Updated game state with UNO status cleared if valid
+ */
+function callUnoSelf(gameState, playerId) {
+    // Validation: Check if the player is actually vulnerable to UNO call
+    if (gameState.unoPlayerId !== playerId) {
+        // Player is not in UNO state or someone else is
+        return { error: 'You are not in UNO state' };
+    }
+    
+    // Find the player
+    const player = gameState.players.find(p => p.id === playerId);
+    if (!player || player.hand.length !== 1) {
+        // Player doesn't exist or doesn't have exactly 1 card
+        return { error: 'Invalid UNO self-call' };
+    }
+    
+    // Create a new state object to avoid mutating the original
+    const newState = {
+        ...gameState,
+        players: gameState.players.map(player => ({
+            ...player,
+            hand: [...player.hand]
+        })),
+        drawPile: [...gameState.drawPile],
+        discardPile: [...gameState.discardPile]
+    };
+    
+    // Clear the UNO flag - player is now safe from penalty
+    newState.unoPlayerId = null;
     
     return newState;
 }
@@ -676,5 +829,7 @@ module.exports = {
     playCard,
     drawCard,
     playDrawnCard,
-    passDrawnCard
+    passDrawnCard,
+    callUnoPenalty,
+    callUnoSelf
 };

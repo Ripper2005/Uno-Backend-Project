@@ -37,10 +37,14 @@ const io = new Server(httpServer, {
 
 // Create MySQL connection pool
 const dbPool = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: 'root', // IMPORTANT: Replace this with your actual MySQL password
-  database: 'uno',
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 3306,
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || 'password',
+  database: process.env.DB_NAME || 'uno',
+  ssl: {
+    rejectUnauthorized: false                 // Required for Aiven SSL connection
+  },
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0
@@ -1315,6 +1319,131 @@ io.on('connection', (socket) => {
         }
     });
     
+    // Handle UNO call penalty (calling UNO on another player)
+    socket.on('player:callUno', async ({ roomId, targetPlayerId }) => {
+        try {
+            // Get current game state from cache
+            const gameState = activeGames[roomId];
+            
+            if (!gameState) {
+                socket.emit('error', { message: 'Game not found in cache' });
+                return;
+            }
+            
+            // Validate that the caller is in the game
+            if (!socket.playerId) {
+                socket.emit('error', { message: 'Player not identified' });
+                return;
+            }
+            
+            // Validate that the target player exists in the game
+            const targetPlayer = gameState.players.find(p => p.id === targetPlayerId);
+            if (!targetPlayer) {
+                socket.emit('error', { message: 'Target player not found in game' });
+                return;
+            }
+            
+            // Use GameEngine to apply the UNO penalty with race condition protection
+            const result = GameEngine.callUnoPenalty(gameState, targetPlayerId, socket.playerId);
+            
+            // Check if the call was successful
+            if (result.error || result.success === false) {
+                // Call was invalid - send feedback but don't update state
+                socket.emit('unoCallResult', {
+                    caller: socket.playerId,
+                    target: targetPlayerId,
+                    success: false,
+                    message: result.error || 'UNO call was invalid'
+                });
+                return;
+            }
+            
+            // Update the cache immediately
+            activeGames[roomId] = result;
+            
+            console.log(`Player ${socket.playerId} successfully called UNO on ${targetPlayerId}`);
+            
+            // Broadcast updated game state to all players immediately
+            const roomState = getRoomStateForClient(result, roomId);
+            io.to(roomId).emit('gameUpdate', roomState);
+            
+            // Send success feedback to all players
+            io.to(roomId).emit('unoCallResult', {
+                caller: socket.playerId,
+                target: targetPlayerId,
+                success: true,
+                message: `${socket.playerId} called UNO on ${targetPlayerId}! ${targetPlayerId} draws 2 penalty cards.`
+            });
+            
+            // Asynchronously update database (write-behind cache)
+            updateGameStateInDB(roomId, result).catch(error => {
+                console.error('Error updating database:', error);
+            });
+            
+        } catch (error) {
+            console.error('Error handling UNO call:', error);
+            socket.emit('error', { message: 'Failed to process UNO call' });
+        }
+    });
+    
+    // Handle self-UNO declaration (player calling UNO on themselves)
+    socket.on('player:callUnoSelf', async ({ roomId }) => {
+        try {
+            // Get current game state from cache
+            const gameState = activeGames[roomId];
+            
+            if (!gameState) {
+                socket.emit('error', { message: 'Game not found in cache' });
+                return;
+            }
+            
+            // Validate that the caller is in the game
+            if (!socket.playerId) {
+                socket.emit('error', { message: 'Player not identified' });
+                return;
+            }
+            
+            // Use GameEngine to handle self-UNO call
+            const result = GameEngine.callUnoSelf(gameState, socket.playerId);
+            
+            // Check if the call was successful
+            if (result.error) {
+                // Call was invalid
+                socket.emit('unoSelfResult', {
+                    player: socket.playerId,
+                    success: false,
+                    message: result.error
+                });
+                return;
+            }
+            
+            // Update the cache immediately
+            activeGames[roomId] = result;
+            
+            console.log(`Player ${socket.playerId} called UNO on themselves (self-declaration)`);
+            
+            // Broadcast updated game state to all players immediately
+            const roomState = getRoomStateForClient(result, roomId);
+            io.to(roomId).emit('gameUpdate', roomState);
+            
+            // Send success feedback to all players
+            io.to(roomId).emit('unoSelfResult', {
+                player: socket.playerId,
+                success: true,
+                message: `${socket.playerId} called UNO! They are now safe from penalty.`
+            });
+            
+            // Asynchronously update database (write-behind cache)
+            updateGameStateInDB(roomId, result).catch(error => {
+                console.error('Error updating database:', error);
+            });
+            
+        } catch (error) {
+            console.error('Error handling self-UNO call:', error);
+            socket.emit('error', { message: 'Failed to process self-UNO call' });
+        }
+    });
+    
     // Handle intentional player leaving
     socket.on('leaveRoom', ({ roomId, playerId, reason }) => {
         try {
@@ -1731,7 +1860,8 @@ function getRoomStateForClient(gameState, roomId) {
             drawPileSize: gameState.drawPile.length,
             isGameOver: gameState.isGameOver,
             winner: gameState.winner,
-            playableDrawnCard: gameState.playableDrawnCard || null
+            playableDrawnCard: gameState.playableDrawnCard || null,
+            unoPlayerId: gameState.unoPlayerId || null
         };
     }
     
@@ -1813,6 +1943,8 @@ httpServer.listen(PORT, async () => {
     console.log(`  drawCard       - Draw a card`);
     console.log(`  playDrawnCard  - Play a card that was just drawn`);
     console.log(`  passDrawnCard  - Pass on a card that was just drawn`);
+    console.log(`  player:callUno - Call UNO on a player (penalty)`);
+    console.log(`  player:callUnoSelf - Call UNO on yourself (self-declaration)`);
     console.log('\nUser accounts and game rooms are stored persistently in MySQL database.');
     console.log('Active games are cached in memory for optimal performance.');
     
