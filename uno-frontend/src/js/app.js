@@ -187,7 +187,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // ============================================================================
     
     // Backend API base URL
-    const API_BASE_URL = 'http://localhost:3001';
+    const API_BASE_URL = 'https://uno-backend-project.onrender.com/';
     
     // User state - backend is the source of truth
     let currentUser = null;
