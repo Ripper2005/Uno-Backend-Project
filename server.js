@@ -13,6 +13,7 @@
  */
 
 // Import required libraries
+require('dotenv').config();
 const express = require('express');
 const { createServer } = require('http');
 const cors = require('cors'); // <-- Import
@@ -40,7 +41,7 @@ const dbPool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'password',
+  password: process.env.DB_PASSWORD || 'root',
   database: process.env.DB_NAME || 'uno',
   ssl: {
     rejectUnauthorized: false                 // Required for Aiven SSL connection
@@ -841,6 +842,144 @@ app.get('/api/rooms/:roomId/hand/:playerId', async (req, res) => {
 });
 
 // ============================================================================
+// DBMS COURSE — NEW API ENDPOINTS (Leaderboard, Stats, History, Dashboard)
+// ============================================================================
+
+/**
+ * GET /api/leaderboard
+ * Returns ranked player standings using the v_leaderboard view
+ * Query params: limit (default 10)
+ * DBMS Concepts: Views, RANK() window function, computed columns
+ */
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 10;
+        const [rows] = await dbPool.execute(
+            'SELECT * FROM v_leaderboard LIMIT ?',
+            [limit.toString()]
+        );
+        res.json({
+            success: true,
+            count: rows.length,
+            leaderboard: rows
+        });
+    } catch (error) {
+        console.error('Error fetching leaderboard:', error);
+        res.status(500).json({ error: 'Failed to fetch leaderboard' });
+    }
+});
+
+/**
+ * GET /api/users/:username/stats
+ * Returns detailed player statistics using the v_player_stats view
+ * DBMS Concepts: Views, LEFT JOIN, GROUP BY, COALESCE, aggregation functions
+ */
+app.get('/api/users/:username/stats', async (req, res) => {
+    try {
+        const { username } = req.params;
+        const [rows] = await dbPool.execute(
+            'SELECT * FROM v_player_stats WHERE username = ?',
+            [username]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+        res.json({
+            success: true,
+            stats: rows[0]
+        });
+    } catch (error) {
+        console.error('Error fetching player stats:', error);
+        res.status(500).json({ error: 'Failed to fetch player stats' });
+    }
+});
+
+/**
+ * GET /api/users/:username/history
+ * Returns paginated match history using the v_match_history view
+ * Query params: page (default 1), limit (default 10)
+ * DBMS Concepts: Views, GROUP_CONCAT, LEFT JOIN, LIMIT/OFFSET pagination
+ */
+app.get('/api/users/:username/history', async (req, res) => {
+    try {
+        const { username } = req.params;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const offset = (page - 1) * limit;
+
+        const [rows] = await dbPool.execute(
+            `SELECT * FROM v_match_history 
+             WHERE player_names LIKE CONCAT('%', ?, '%') 
+             ORDER BY completed_at DESC 
+             LIMIT ? OFFSET ?`,
+            [username, limit.toString(), offset.toString()]
+        );
+
+        // Get total count for pagination
+        const [countRows] = await dbPool.execute(
+            `SELECT COUNT(*) AS total FROM v_match_history 
+             WHERE player_names LIKE CONCAT('%', ?, '%')`,
+            [username]
+        );
+
+        res.json({
+            success: true,
+            page,
+            limit,
+            totalMatches: countRows[0].total,
+            totalPages: Math.ceil(countRows[0].total / limit),
+            matches: rows
+        });
+    } catch (error) {
+        console.error('Error fetching match history:', error);
+        res.status(500).json({ error: 'Failed to fetch match history' });
+    }
+});
+
+/**
+ * GET /api/users/:username/dashboard
+ * Returns full player dashboard using the sp_get_player_dashboard stored procedure
+ * DBMS Concepts: Stored procedures, multiple result sets, CASE, ROW_NUMBER(),
+ *               correlated subqueries, multi-table JOINs
+ */
+app.get('/api/users/:username/dashboard', async (req, res) => {
+    let connection;
+    try {
+        const { username } = req.params;
+        connection = await dbPool.getConnection();
+
+        // Call stored procedure — returns multiple result sets
+        const [results] = await connection.query(
+            'CALL sp_get_player_dashboard(?)',
+            [username]
+        );
+
+        // results[0] = profile, results[1] = recent matches, results[2] = rank
+        const profile = results[0] && results[0].length > 0 ? results[0][0] : null;
+        const recentMatches = results[1] || [];
+        const rankResult = results[2] && results[2].length > 0 ? results[2][0] : null;
+
+        if (!profile) {
+            return res.status(404).json({ error: 'Player not found' });
+        }
+
+        res.json({
+            success: true,
+            dashboard: {
+                profile,
+                leaderboardRank: rankResult ? rankResult.player_rank : null,
+                recentMatches
+            }
+        });
+    } catch (error) {
+        console.error('Error fetching player dashboard:', error);
+        res.status(500).json({ error: 'Failed to fetch player dashboard' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// ============================================================================
 // WEBSOCKET EVENT HANDLERS
 // ============================================================================
 
@@ -1133,14 +1272,19 @@ io.on('connection', (socket) => {
             
             console.log(`Player ${playerId} played card: ${card.color} ${card.value}`);
             
+            // Log card_played event for audit trail
+            logGameEvent(roomId, playerId, 'card_played', {
+                card: card,
+                chosenColor: chosenColor || null
+            });
+            
             // Check if game is over
             if (result.isGameOver) {
                 console.log(`Game over! Winner: ${result.winner}`);
                 
-                // Update player statistics asynchronously
-                const allPlayerIds = result.players.map(player => player.id);
-                updatePlayerStats(result.winner, allPlayerIds).catch(error => {
-                    console.error('Error updating player statistics:', error);
+                // Finalize game using stored procedure (fixes double-counting bug)
+                finalizeGame(roomId, result.winner, result.players).catch(error => {
+                    console.error('Error finalizing game:', error);
                 });
                 
                 // Get room info for originalHost
@@ -1265,14 +1409,18 @@ io.on('connection', (socket) => {
             
             console.log(`Player ${playerId} played their drawn card`);
             
+            // Log drawn_card_played event for audit trail
+            logGameEvent(roomId, playerId, 'drawn_card_played', {
+                chosenColor: chosenColor || null
+            });
+            
             // Check if game is over
             if (result.isGameOver) {
                 console.log(`Game over! Winner: ${result.winner}`);
                 
-                // Update player statistics asynchronously
-                const allPlayerIds = result.players.map(player => player.id);
-                updatePlayerStats(result.winner, allPlayerIds).catch(error => {
-                    console.error('Error updating player statistics:', error);
+                // Finalize game using stored procedure (fixes double-counting bug)
+                finalizeGame(roomId, result.winner, result.players).catch(error => {
+                    console.error('Error finalizing game:', error);
                 });
                 
                 // Get room info for originalHost
@@ -1864,16 +2012,25 @@ async function updateGameStateInDB(roomId, gameState) {
         
         const status = gameState.isGameOver ? 'completed' : 'in_progress';
         
-        // If game is over, get winner's user ID
+        // If game is over, get winner's user ID and set completion timestamps
         let winnerId = null;
         if (gameState.isGameOver && gameState.winner) {
             winnerId = await getUserId(gameState.winner);
+            
+            // Set completed_at and duration_seconds for completed games
+            await connection.execute(
+                `UPDATE games SET status = ?, game_state = ?, winner_id = ?, 
+                 completed_at = NOW(), 
+                 duration_seconds = TIMESTAMPDIFF(SECOND, created_at, NOW()) 
+                 WHERE room_code = ?`,
+                [status, JSON.stringify(gameState), winnerId, roomId]
+            );
+        } else {
+            await connection.execute(
+                'UPDATE games SET status = ?, game_state = ?, winner_id = ? WHERE room_code = ?',
+                [status, JSON.stringify(gameState), winnerId, roomId]
+            );
         }
-        
-        await connection.execute(
-            'UPDATE games SET status = ?, game_state = ?, winner_id = ? WHERE room_code = ?',
-            [status, JSON.stringify(gameState), winnerId, roomId]
-        );
         
         console.log(`Database updated for room ${roomId} (status: ${status}${winnerId ? `, winner: ${gameState.winner}` : ''})`);
         
@@ -2090,14 +2247,19 @@ async function handlePlayerDisconnect(roomId, playerId, socket, reason = 'discon
                     const winnerId = gameState.winner ? await getUserId(gameState.winner) : null;
                     
                     await connection.execute(
-                        'UPDATE games SET status = ?, game_state = ?, winner_id = ? WHERE id = ?',
+                        'UPDATE games SET status = ?, game_state = ?, winner_id = ?, completed_at = NOW(), duration_seconds = TIMESTAMPDIFF(SECOND, created_at, NOW()) WHERE id = ?',
                         ['completed', JSON.stringify(gameState), winnerId, gameData.id]
                     );
                     
-                    // Update player statistics asynchronously
-                    const allPlayerIds = gameState.players.map(player => player.id);
-                    updatePlayerStats(gameState.winner, allPlayerIds).catch(error => {
-                        console.error('Error updating player statistics after disconnect:', error);
+                    // Finalize game using stored procedure (fixes double-counting bug)
+                    finalizeGame(roomId, gameState.winner, gameState.players).catch(error => {
+                        console.error('Error finalizing game after disconnect:', error);
+                    });
+                    
+                    // Log disconnect event
+                    logGameEvent(roomId, playerId, 'player_disconnected', {
+                        gameEnded: true,
+                        winner: gameState.winner
                     });
                     
                     socket.to(roomId).emit('gameOver', {
@@ -2234,49 +2396,127 @@ function getRoomStateForClient(gameState, roomId) {
 }
 
 /**
- * Updates player statistics in the database when a game is completed
- * @param {string} winnerUsername - The username of the winning player
- * @param {Array<string>} allPlayerUsernames - Array of all player usernames who participated
+ * [DEPRECATED — replaced by finalizeGame() which calls sp_finalize_game stored procedure]
+ * The original updatePlayerStats() had a double-counting bug:
+ * It incremented games_played for the winner TWICE — once in the winner UPDATE
+ * and again in the bulk UPDATE for all players.
+ *
+ * The fix is in sp_finalize_game: it updates the winner's stats first,
+ * then updates all OTHER participants (excluding the winner).
  */
-async function updatePlayerStats(winnerUsername, allPlayerUsernames) {
+
+/**
+ * Finalizes a completed game by calling the sp_finalize_game stored procedure.
+ * This atomically: updates game status, sets winner, timestamps, and player stats.
+ * Fixes the double-counting bug from the old updatePlayerStats() function.
+ * 
+ * @param {string} roomCode - The room code of the game
+ * @param {string} winnerUsername - The username of the winning player
+ * @param {Array} players - Array of player objects from game state
+ */
+async function finalizeGame(roomCode, winnerUsername, players) {
     let connection;
     try {
         connection = await dbPool.getConnection();
-        await connection.beginTransaction();
         
-        // Update winner's stats (increment both games_won and games_played)
-        if (winnerUsername) {
-            await connection.execute(
-                'UPDATE users SET games_won = games_won + 1, games_played = games_played + 1 WHERE username = ?',
-                [winnerUsername]
-            );
-            
-            console.log(`Updated winner stats for: ${winnerUsername}`);
-        }
+        // Call stored procedure for atomic game finalization
+        await connection.query(
+            'CALL sp_finalize_game(?, ?)',
+            [roomCode, winnerUsername || '']
+        );
         
-        // For all players, increment games_played
-        if (allPlayerUsernames.length > 0) {
-            const placeholders = allPlayerUsernames.map(() => '?').join(',');
-            await connection.execute(
-                `UPDATE users SET games_played = games_played + 1 WHERE username IN (${placeholders})`,
-                allPlayerUsernames
-            );
-            
-            console.log(`Incremented games_played for players: ${allPlayerUsernames.join(', ')}`);
-        }
+        console.log(`Game finalized via stored procedure for room ${roomCode} (winner: ${winnerUsername})`);
         
-        // Commit transaction
-        await connection.commit();
+        // Populate match_results for per-player game stats
+        await populateMatchResults(connection, roomCode, winnerUsername, players);
         
     } catch (error) {
-        if (connection) {
-            await connection.rollback();
-        }
-        console.error('Error updating player statistics:', error);
+        console.error('Error finalizing game:', error);
     } finally {
         if (connection) {
             connection.release();
         }
+    }
+}
+
+/**
+ * Populates the match_results table with per-player statistics for a completed game.
+ * This is the denormalized summary table for fast leaderboard/history queries.
+ * 
+ * @param {Object} connection - Active database connection
+ * @param {string} roomCode - The room code of the game
+ * @param {string} winnerUsername - The username of the winning player
+ * @param {Array} players - Array of player objects from game state
+ */
+async function populateMatchResults(connection, roomCode, winnerUsername, players) {
+    try {
+        // Get game ID from room code
+        const [gameRows] = await connection.execute(
+            'SELECT id FROM games WHERE room_code = ?',
+            [roomCode]
+        );
+        
+        if (gameRows.length === 0) return;
+        
+        const gameId = gameRows[0].id;
+        
+        // Insert match results for each player
+        for (let i = 0; i < players.length; i++) {
+            const player = players[i];
+            const userId = await getUserId(player.id);
+            if (!userId) continue;
+            
+            await connection.execute(
+                `INSERT IGNORE INTO match_results 
+                 (game_id, user_id, is_winner, final_hand_size, finish_position) 
+                 VALUES (?, ?, ?, ?, ?)`,
+                [
+                    gameId,
+                    userId,
+                    player.id === winnerUsername ? 1 : 0,
+                    player.hand ? player.hand.length : 0,
+                    player.id === winnerUsername ? 1 : i + 1
+                ]
+            );
+        }
+        
+        console.log(`Match results populated for room ${roomCode} (${players.length} players)`);
+        
+    } catch (error) {
+        console.error('Error populating match results:', error);
+    }
+}
+
+/**
+ * Logs a game event to the game_events audit log table.
+ * Fire-and-forget: errors are logged but do not interrupt gameplay.
+ * 
+ * @param {string} roomCode - The room code of the game
+ * @param {string} username - The username of the player who performed the action
+ * @param {string} eventType - The type of event (must match ENUM in game_events table)
+ * @param {Object} eventData - Additional event data (stored as JSON)
+ */
+async function logGameEvent(roomCode, username, eventType, eventData = null) {
+    try {
+        // Get game ID and user ID
+        const [gameRows] = await dbPool.execute(
+            'SELECT id FROM games WHERE room_code = ? LIMIT 1',
+            [roomCode]
+        );
+        
+        if (gameRows.length === 0) return;
+        
+        const gameId = gameRows[0].id;
+        const userId = username ? await getUserId(username) : null;
+        
+        await dbPool.execute(
+            'INSERT INTO game_events (game_id, user_id, event_type, event_data) VALUES (?, ?, ?, ?)',
+            [gameId, userId, eventType, eventData ? JSON.stringify(eventData) : null]
+        );
+        
+    } catch (error) {
+        // Fire-and-forget: don't interrupt gameplay for audit failures
+        console.error(`Error logging game event (${eventType}):`, error.message);
     }
 }
 
@@ -2299,6 +2539,10 @@ httpServer.listen(PORT, () => {
     console.log('  POST /api/rooms/:roomId/join        - Join existing room');
     console.log('  GET  /api/rooms/:roomId             - Get room state');
     console.log('  GET  /api/rooms/:roomId/hand/:playerId - Get player hand');
+    console.log('  GET  /api/leaderboard               - Player leaderboard (v_leaderboard view)');
+    console.log('  GET  /api/users/:username/stats     - Player statistics (v_player_stats view)');
+    console.log('  GET  /api/users/:username/history   - Match history (v_match_history view)');
+    console.log('  GET  /api/users/:username/dashboard - Player dashboard (sp_get_player_dashboard)');
     console.log('');
     console.log('🎯 WebSocket events:');
     console.log('  joinRoom         - Join a game room');
