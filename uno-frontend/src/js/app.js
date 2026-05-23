@@ -187,7 +187,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // ============================================================================
     
     // Backend API base URL
-    const API_BASE_URL = 'http://localhost:3001';
+    const API_BASE_URL = '';
     
     // User state - backend is the source of truth
     let currentUser = null;
@@ -784,7 +784,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // Helper to ensure socket connection
     function ensureSocket() {
         if (!socket) {
-            socket = io(`${API_BASE_URL}`);
+            socket = io();
             setupSocketListeners();
         }
     }
